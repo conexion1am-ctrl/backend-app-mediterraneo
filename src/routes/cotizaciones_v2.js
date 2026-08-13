@@ -132,5 +132,23 @@ router.post('/:id/aceptar', async (req, res) => {
     client.release();
   }
 });
+// 👁️ LISTAR contratos de una empresa
+router.get('/contratos/listar/:empresa_id', async (req, res) => {
+  try {
+    const { empresa_id } = req.params;
+    const result = await pool.query(
+      `SELECT ct.*, p.nombre AS proyecto_nombre 
+       FROM contratos ct 
+       LEFT JOIN proyectos p ON p.id = ct.proyecto_id 
+       WHERE ct.empresa_id = $1 
+       ORDER BY ct.created_at DESC`,
+      [empresa_id]
+    );
+    res.json({ total: result.rows.length, contratos: result.rows });
+  } catch (error) {
+    console.error('Error listando contratos:', error);
+    res.status(500).json({ error: 'Error al listar contratos' });
+  }
+});
 
 module.exports = router;

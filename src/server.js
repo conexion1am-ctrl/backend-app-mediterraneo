@@ -20,6 +20,7 @@ const invitacionesRoutes = require('./routes/invitaciones');
 const mensajesRoutes = require('./routes/mensajes');
 const clientesRoutes = require('./routes/clientes');
 const cotizacionesRoutes = require('./routes/cotizaciones_v2');
+const estadisticasRoutes = require('./routes/estadisticas');
 
 // Usar rutas
 app.use('/api/proyectos', proyectosRoutes);
@@ -28,6 +29,7 @@ app.use('/api/invitaciones', invitacionesRoutes);
 app.use('/api/mensajes', mensajesRoutes);
 app.use('/api/clientes', clientesRoutes);
 app.use('/api/cotizaciones', cotizacionesRoutes);
+app.use('/api/estadisticas', estadisticasRoutes);
 
 
 // Rutas básicas
