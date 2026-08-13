@@ -14,9 +14,11 @@ app.use(bodyParser.json());
 app.use(bodyParser.urlencoded({ extended: true }));
 // Importar rutas
 const proyectosRoutes = require('./routes/proyectos');
+const empresasRoutes = require('./routes/empresas');
 
 // Usar rutas
 app.use('/api/proyectos', proyectosRoutes);
+app.use('/api/empresas', empresasRoutes);
 const cotizacionesRoutes = require('./routes/cotizaciones');
 app.use('/api/cotizaciones', cotizacionesRoutes);
 
