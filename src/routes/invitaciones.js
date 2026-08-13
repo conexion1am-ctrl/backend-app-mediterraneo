@@ -114,5 +114,23 @@ router.post('/aceptar/:token', async (req, res) => {
     client.release();
   }
 });
+// 👁️ LISTAR invitaciones pendientes de una empresa
+router.get('/pendientes/:empresa_id', async (req, res) => {
+  try {
+    const { empresa_id } = req.params;
+    const result = await pool.query(
+      `SELECT i.*, a.nombre AS area_nombre
+       FROM invitaciones i
+       JOIN areas_catalogo a ON a.id = i.area_id
+       WHERE i.empresa_id = $1 AND i.usado = FALSE
+       ORDER BY i.created_at DESC`,
+      [empresa_id]
+    );
+    res.json({ total: result.rows.length, invitaciones: result.rows });
+  } catch (error) {
+    console.error('Error listando invitaciones pendientes:', error);
+    res.status(500).json({ error: 'Error al listar invitaciones pendientes' });
+  }
+});
 
 module.exports = router;
