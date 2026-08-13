@@ -128,5 +128,84 @@ router.get('/:id/equipo', async (req, res) => {
     res.status(500).json({ error: 'Error al obtener equipo del proyecto' });
   }
 });
+// ✏️ EDITAR datos generales de un proyecto
+router.put('/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { nombre, direccion, area_m2, ubicacion_lat, ubicacion_lng } = req.body;
+
+    const result = await pool.query(
+      `UPDATE proyectos 
+       SET nombre = COALESCE($1, nombre), 
+           direccion = COALESCE($2, direccion), 
+           area_m2 = COALESCE($3, area_m2),
+           ubicacion_lat = COALESCE($4, ubicacion_lat),
+           ubicacion_lng = COALESCE($5, ubicacion_lng),
+           updated_at = CURRENT_TIMESTAMP
+       WHERE id = $6 RETURNING *`,
+      [nombre, direccion, area_m2, ubicacion_lat, ubicacion_lng, id]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Proyecto no encontrado' });
+    }
+
+    res.json({ mensaje: 'Proyecto actualizado exitosamente', proyecto: result.rows[0] });
+  } catch (error) {
+    console.error('Error actualizando proyecto:', error);
+    res.status(500).json({ error: 'Error al actualizar proyecto' });
+  }
+});
+
+// ➕ AGREGAR una nueva actividad (área) a un proyecto ya existente
+router.post('/:id/actividades/agregar', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { area_id } = req.body;
+
+    if (!area_id) {
+      return res.status(400).json({ error: 'area_id es obligatorio' });
+    }
+
+    // Evitar duplicar la misma actividad
+    const existe = await pool.query(
+      'SELECT * FROM proyecto_actividades WHERE proyecto_id = $1 AND area_id = $2',
+      [id, area_id]
+    );
+    if (existe.rows.length > 0) {
+      return res.status(400).json({ error: 'Esta actividad ya está agregada a este proyecto' });
+    }
+
+    const result = await pool.query(
+      'INSERT INTO proyecto_actividades (proyecto_id, area_id) VALUES ($1, $2) RETURNING *',
+      [id, area_id]
+    );
+
+    res.status(201).json({ mensaje: 'Actividad agregada exitosamente', actividad: result.rows[0] });
+  } catch (error) {
+    console.error('Error agregando actividad:', error);
+    res.status(500).json({ error: 'Error al agregar actividad' });
+  }
+});
+
+// 🗑️ ELIMINAR proyecto (soft delete)
+router.delete('/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const result = await pool.query(
+      "UPDATE proyectos SET estado = 'eliminado', updated_at = CURRENT_TIMESTAMP WHERE id = $1 RETURNING *",
+      [id]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Proyecto no encontrado' });
+    }
+
+    res.json({ mensaje: 'Proyecto eliminado exitosamente' });
+  } catch (error) {
+    console.error('Error eliminando proyecto:', error);
+    res.status(500).json({ error: 'Error al eliminar proyecto' });
+  }
+});
 
 module.exports = router;
