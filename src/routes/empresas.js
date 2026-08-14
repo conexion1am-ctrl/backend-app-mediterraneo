@@ -1,5 +1,6 @@
 const express = require('express');
 const { Pool } = require('pg');
+const bcrypt = require('bcryptjs');
 const router = express.Router();
 require('dotenv').config();
 
@@ -12,10 +13,14 @@ const pool = new Pool({
 router.post('/crear-perfil', async (req, res) => {
   const client = await pool.connect();
   try {
-    const { nombre_empresa, logo_url, sitio_web, color_hex, nombre_usuario, celular } = req.body;
+    const { nombre_empresa, logo_url, sitio_web, color_hex, nombre_usuario, celular, contraseña } = req.body;
 
-    if (!nombre_empresa || !nombre_usuario || !celular) {
-      return res.status(400).json({ error: 'Nombre de empresa, nombre de usuario y celular son obligatorios' });
+    if (!nombre_empresa || !nombre_usuario || !celular || !contraseña) {
+      return res.status(400).json({ error: 'Nombre de empresa, nombre de usuario, celular y contraseña son obligatorios' });
+    }
+
+    if (contraseña.length < 6) {
+      return res.status(400).json({ error: 'La contraseña debe tener al menos 6 caracteres' });
     }
 
     await client.query('BEGIN');
@@ -27,30 +32,44 @@ router.post('/crear-perfil', async (req, res) => {
     );
     const empresa = empresaResult.rows[0];
 
-    // 2. Crear o encontrar el usuario (por celular)
+    // 2. Encriptar contraseña
+    const contraseñaHash = await bcrypt.hash(contraseña, 10);
+
+    // 3. Crear o encontrar el usuario (por celular)
     let usuarioResult = await client.query('SELECT * FROM usuarios WHERE celular = $1', [celular]);
     let usuario;
     if (usuarioResult.rows.length > 0) {
       usuario = usuarioResult.rows[0];
+      // Si ya existía sin contraseña, se la asignamos ahora
+      if (!usuario.contraseña_hash) {
+        const actualizado = await client.query(
+          'UPDATE usuarios SET contraseña_hash = $1 WHERE id = $2 RETURNING *',
+          [contraseñaHash, usuario.id]
+        );
+        usuario = actualizado.rows[0];
+      }
     } else {
       const nuevoUsuario = await client.query(
-        'INSERT INTO usuarios (celular, nombre) VALUES ($1, $2) RETURNING *',
-        [celular, nombre_usuario]
+        'INSERT INTO usuarios (celular, nombre, contraseña_hash) VALUES ($1, $2, $3) RETURNING *',
+        [celular, nombre_usuario, contraseñaHash]
       );
       usuario = nuevoUsuario.rows[0];
     }
 
-    // 3. Buscar el area_id de GERENCIA
+    // 4. Buscar el area_id de GERENCIA
     const areaResult = await client.query("SELECT id FROM areas_catalogo WHERE nombre = 'GERENCIA'");
     const areaGerenciaId = areaResult.rows[0].id;
 
-    // 4. Vincular usuario a empresa como Gerencia
+    // 5. Vincular usuario a empresa como Gerencia
     const vinculo = await client.query(
       'INSERT INTO usuario_empresa_rol (usuario_id, empresa_id, area_id, estado) VALUES ($1, $2, $3, $4) RETURNING *',
       [usuario.id, empresa.id, areaGerenciaId, 'activo']
     );
 
     await client.query('COMMIT');
+
+    // No devolvemos el hash de la contraseña en la respuesta
+    delete usuario.contraseña_hash;
 
     res.status(201).json({
       mensaje: 'Perfil de empresa creado exitosamente',
