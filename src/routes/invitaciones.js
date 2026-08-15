@@ -78,7 +78,6 @@ router.post('/aceptar/:token', async (req, res) => {
 
     await client.query('BEGIN');
 
-    // Crear o encontrar usuario por celular
     let usuarioResult = await client.query('SELECT * FROM usuarios WHERE celular = $1', [invitacion.celular_invitado]);
     let usuario;
     if (usuarioResult.rows.length > 0) {
@@ -91,13 +90,11 @@ router.post('/aceptar/:token', async (req, res) => {
       usuario = nuevoUsuario.rows[0];
     }
 
-    // Vincular a la empresa con el área correspondiente
     await client.query(
       'INSERT INTO usuario_empresa_rol (usuario_id, empresa_id, area_id, estado) VALUES ($1, $2, $3, $4)',
       [usuario.id, invitacion.empresa_id, invitacion.area_id, 'activo']
     );
 
-    // Marcar invitación como usada
     await client.query('UPDATE invitaciones SET usado = TRUE WHERE token = $1', [token]);
 
     await client.query('COMMIT');
@@ -114,6 +111,7 @@ router.post('/aceptar/:token', async (req, res) => {
     client.release();
   }
 });
+
 // 👁️ LISTAR invitaciones pendientes de una empresa
 router.get('/pendientes/:empresa_id', async (req, res) => {
   try {
@@ -130,6 +128,52 @@ router.get('/pendientes/:empresa_id', async (req, res) => {
   } catch (error) {
     console.error('Error listando invitaciones pendientes:', error);
     res.status(500).json({ error: 'Error al listar invitaciones pendientes' });
+  }
+});
+
+// ✏️ EDITAR una invitación pendiente (nombre, celular, área)
+router.put('/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { nombre_invitado, celular_invitado, area_id } = req.body;
+
+    if (!nombre_invitado || !celular_invitado || !area_id) {
+      return res.status(400).json({ error: 'nombre_invitado, celular_invitado y area_id son obligatorios' });
+    }
+
+    const result = await pool.query(
+      `UPDATE invitaciones
+       SET nombre_invitado = $1, celular_invitado = $2, area_id = $3
+       WHERE id = $4 AND usado = FALSE
+       RETURNING *`,
+      [nombre_invitado, celular_invitado, area_id, id]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Invitación pendiente no encontrada (puede que ya haya sido aceptada)' });
+    }
+
+    res.json({ mensaje: 'Invitación actualizada exitosamente', invitacion: result.rows[0] });
+  } catch (error) {
+    console.error('Error editando invitación:', error);
+    res.status(500).json({ error: 'Error al editar invitación' });
+  }
+});
+
+// 🗑️ ELIMINAR una invitación pendiente por completo
+router.delete('/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const result = await pool.query('DELETE FROM invitaciones WHERE id = $1 AND usado = FALSE RETURNING *', [id]);
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Invitación pendiente no encontrada (puede que ya haya sido aceptada)' });
+    }
+
+    res.json({ mensaje: 'Invitación eliminada exitosamente' });
+  } catch (error) {
+    console.error('Error eliminando invitación:', error);
+    res.status(500).json({ error: 'Error al eliminar invitación' });
   }
 });
 

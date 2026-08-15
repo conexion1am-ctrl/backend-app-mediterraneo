@@ -128,6 +128,27 @@ router.get('/:id/equipo', async (req, res) => {
     res.status(500).json({ error: 'Error al obtener equipo del proyecto' });
   }
 });
+
+// 👤 VER en qué proyectos y áreas está asignada una persona actualmente
+router.get('/asignaciones/:usuario_id', async (req, res) => {
+  try {
+    const { usuario_id } = req.params;
+    const result = await pool.query(
+      `SELECT p.id AS proyecto_id, p.nombre AS proyecto_nombre, a.id AS area_id, a.nombre AS area_nombre
+       FROM proyecto_equipo pe
+       JOIN proyectos p ON p.id = pe.proyecto_id
+       JOIN areas_catalogo a ON a.id = pe.area_id
+       WHERE pe.usuario_id = $1 AND p.estado = 'activo'
+       ORDER BY p.nombre`,
+      [usuario_id]
+    );
+    res.json({ total: result.rows.length, asignaciones: result.rows });
+  } catch (error) {
+    console.error('Error obteniendo asignaciones:', error);
+    res.status(500).json({ error: 'Error al obtener asignaciones de la persona' });
+  }
+});
+
 // ✏️ EDITAR datos generales de un proyecto
 router.put('/:id', async (req, res) => {
   try {

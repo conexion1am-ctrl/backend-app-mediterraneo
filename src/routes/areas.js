@@ -24,7 +24,6 @@ router.get('/personal/:empresa_id', async (req, res) => {
   try {
     const { empresa_id } = req.params;
 
-    // Vinculados: ya aceptaron la invitación y están en usuario_empresa_rol
     const vinculados = await pool.query(
       `SELECT uer.id AS rol_id, u.id AS usuario_id, u.nombre, u.celular, u.foto_url,
               a.id AS area_id, a.nombre AS area_nombre, a.tipo AS area_tipo,
@@ -36,7 +35,6 @@ router.get('/personal/:empresa_id', async (req, res) => {
       [empresa_id]
     );
 
-    // Pendientes: invitación generada pero todavía no aceptada
     const pendientes = await pool.query(
       `SELECT i.id AS rol_id, NULL AS usuario_id, i.nombre_invitado AS nombre, i.celular_invitado AS celular, NULL AS foto_url,
               a.id AS area_id, a.nombre AS area_nombre, a.tipo AS area_tipo,
@@ -64,7 +62,6 @@ router.get('/verificar-celular/:empresa_id/:celular', async (req, res) => {
   try {
     const { empresa_id, celular } = req.params;
 
-    // ¿Ya aceptó y es parte activa del equipo?
     const activo = await pool.query(
       `SELECT u.nombre, a.nombre AS area_nombre
        FROM usuario_empresa_rol uer
@@ -83,7 +80,6 @@ router.get('/verificar-celular/:empresa_id/:celular', async (req, res) => {
       });
     }
 
-    // ¿Tiene invitación pendiente sin aceptar?
     const pendiente = await pool.query(
       `SELECT nombre_invitado, a.nombre AS area_nombre
        FROM invitaciones i
@@ -105,6 +101,94 @@ router.get('/verificar-celular/:empresa_id/:celular', async (req, res) => {
   } catch (error) {
     console.error('Error verificando celular:', error);
     res.status(500).json({ error: 'Error al verificar celular' });
+  }
+});
+
+// ✏️ EDITAR nombre de una persona VINCULADA (afecta todas sus áreas, el nombre vive en usuarios)
+router.put('/personal/vinculado/:usuario_id/nombre', async (req, res) => {
+  try {
+    const { usuario_id } = req.params;
+    const { nombre } = req.body;
+
+    if (!nombre || !nombre.trim()) {
+      return res.status(400).json({ error: 'El nombre es obligatorio' });
+    }
+
+    const result = await pool.query('UPDATE usuarios SET nombre = $1 WHERE id = $2 RETURNING *', [nombre, usuario_id]);
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Persona no encontrada' });
+    }
+
+    res.json({ mensaje: 'Nombre actualizado exitosamente', usuario: result.rows[0] });
+  } catch (error) {
+    console.error('Error editando nombre:', error);
+    res.status(500).json({ error: 'Error al editar nombre' });
+  }
+});
+
+// ➕ AGREGAR una nueva área a una persona VINCULADA
+router.post('/personal/vinculado/:usuario_id/areas', async (req, res) => {
+  try {
+    const { usuario_id } = req.params;
+    const { empresa_id, area_id } = req.body;
+
+    if (!empresa_id || !area_id) {
+      return res.status(400).json({ error: 'empresa_id y area_id son obligatorios' });
+    }
+
+    const existe = await pool.query(
+      `SELECT * FROM usuario_empresa_rol WHERE usuario_id = $1 AND empresa_id = $2 AND area_id = $3 AND estado = 'activo'`,
+      [usuario_id, empresa_id, area_id]
+    );
+    if (existe.rows.length > 0) {
+      return res.status(400).json({ error: 'Esta persona ya tiene esa área asignada' });
+    }
+
+    const result = await pool.query(
+      'INSERT INTO usuario_empresa_rol (usuario_id, empresa_id, area_id, estado) VALUES ($1, $2, $3, $4) RETURNING *',
+      [usuario_id, empresa_id, area_id, 'activo']
+    );
+
+    res.status(201).json({ mensaje: 'Área agregada exitosamente', rol: result.rows[0] });
+  } catch (error) {
+    console.error('Error agregando área:', error);
+    res.status(500).json({ error: 'Error al agregar área' });
+  }
+});
+
+// 🚫 QUITAR una persona VINCULADA de un área específica (rol_id), o desactivarla de la empresa por completo
+router.delete('/personal/vinculado/:rol_id', async (req, res) => {
+  try {
+    const { rol_id } = req.params;
+    const { todas } = req.query; // ?todas=true para desactivar TODAS sus áreas en la empresa
+
+    if (todas === 'true') {
+      const rolActual = await pool.query('SELECT * FROM usuario_empresa_rol WHERE id = $1', [rol_id]);
+      if (rolActual.rows.length === 0) {
+        return res.status(404).json({ error: 'Registro no encontrado' });
+      }
+      const { usuario_id, empresa_id } = rolActual.rows[0];
+      await pool.query(
+        `UPDATE usuario_empresa_rol SET estado = 'inactivo' WHERE usuario_id = $1 AND empresa_id = $2`,
+        [usuario_id, empresa_id]
+      );
+      return res.json({ mensaje: 'Persona desactivada de la empresa exitosamente' });
+    }
+
+    const result = await pool.query(
+      "UPDATE usuario_empresa_rol SET estado = 'inactivo' WHERE id = $1 RETURNING *",
+      [rol_id]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Registro no encontrado' });
+    }
+
+    res.json({ mensaje: 'Área removida de esta persona exitosamente' });
+  } catch (error) {
+    console.error('Error desactivando persona/área:', error);
+    res.status(500).json({ error: 'Error al desactivar' });
   }
 });
 
