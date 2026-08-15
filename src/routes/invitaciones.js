@@ -1,5 +1,6 @@
 const express = require('express');
 const { Pool } = require('pg');
+const bcrypt = require('bcryptjs');
 const router = express.Router();
 require('dotenv').config();
 
@@ -7,6 +8,8 @@ const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: { rejectUnauthorized: false }
 });
+
+const AREAS_ADMINISTRATIVAS = ['GERENCIA', 'AREA ADMINISTRATIVA', 'AREA DE LOGISTICA'];
 
 // 📝 GENERAR invitación (agregar personal desde Grupo de Trabajo)
 router.post('/generar', async (req, res) => {
@@ -23,7 +26,7 @@ router.post('/generar', async (req, res) => {
     );
 
     const invitacion = result.rows[0];
-    const link = `https://backend-app-mediterraneo.onrender.com/api/invitaciones/aceptar/${invitacion.token}`;
+    const link = `cydmanager://invitacion/${invitacion.token}`;
 
     res.status(201).json({
       mensaje: 'Invitación generada exitosamente',
@@ -65,8 +68,15 @@ router.post('/aceptar/:token', async (req, res) => {
   const client = await pool.connect();
   try {
     const { token } = req.params;
+    const { contraseña } = req.body;
 
-    const invResult = await client.query('SELECT * FROM invitaciones WHERE token = $1', [token]);
+    const invResult = await client.query(
+      `SELECT i.*, a.nombre AS area_nombre
+       FROM invitaciones i
+       JOIN areas_catalogo a ON a.id = i.area_id
+       WHERE i.token = $1`,
+      [token]
+    );
     if (invResult.rows.length === 0) {
       return res.status(404).json({ error: 'Invitación no encontrada' });
     }
@@ -76,16 +86,37 @@ router.post('/aceptar/:token', async (req, res) => {
       return res.status(400).json({ error: 'Esta invitación ya fue utilizada' });
     }
 
+    const esAdministrativa = AREAS_ADMINISTRATIVAS.includes(invitacion.area_nombre);
+
+    if (esAdministrativa) {
+      if (!contraseña || contraseña.length < 6) {
+        return res.status(400).json({ error: 'Esta área requiere una contraseña de al menos 6 caracteres' });
+      }
+    }
+
     await client.query('BEGIN');
 
     let usuarioResult = await client.query('SELECT * FROM usuarios WHERE celular = $1', [invitacion.celular_invitado]);
     let usuario;
+
     if (usuarioResult.rows.length > 0) {
       usuario = usuarioResult.rows[0];
+      if (esAdministrativa && !usuario.contraseña_hash) {
+        const hash = await bcrypt.hash(contraseña, 10);
+        const actualizado = await client.query(
+          'UPDATE usuarios SET contraseña_hash = $1 WHERE id = $2 RETURNING *',
+          [hash, usuario.id]
+        );
+        usuario = actualizado.rows[0];
+      }
     } else {
+      let contraseñaHash = null;
+      if (esAdministrativa) {
+        contraseñaHash = await bcrypt.hash(contraseña, 10);
+      }
       const nuevoUsuario = await client.query(
-        'INSERT INTO usuarios (celular, nombre) VALUES ($1, $2) RETURNING *',
-        [invitacion.celular_invitado, invitacion.nombre_invitado]
+        'INSERT INTO usuarios (celular, nombre, contraseña_hash) VALUES ($1, $2, $3) RETURNING *',
+        [invitacion.celular_invitado, invitacion.nombre_invitado, contraseñaHash]
       );
       usuario = nuevoUsuario.rows[0];
     }
@@ -98,6 +129,8 @@ router.post('/aceptar/:token', async (req, res) => {
     await client.query('UPDATE invitaciones SET usado = TRUE WHERE token = $1', [token]);
 
     await client.query('COMMIT');
+
+    delete usuario.contraseña_hash;
 
     res.json({
       mensaje: 'Invitación aceptada, usuario vinculado exitosamente',
