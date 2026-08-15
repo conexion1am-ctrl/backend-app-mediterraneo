@@ -26,7 +26,7 @@ router.post('/generar', async (req, res) => {
     );
 
     const invitacion = result.rows[0];
-    const link = `cydmanager://invitacion/${invitacion.token}`;
+    const link = `frontendappmedv2://invitacion/${invitacion.token}`;
 
     res.status(201).json({
       mensaje: 'Invitación generada exitosamente',

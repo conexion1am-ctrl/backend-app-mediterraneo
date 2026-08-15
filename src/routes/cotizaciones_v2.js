@@ -84,7 +84,7 @@ router.get('/:id', async (req, res) => {
   }
 });
 
-// ✅ ACEPTAR cotización → crea contrato automáticamente
+// ✅ ACEPTAR cotización → crea el proyecto (si no existía) y el contrato automáticamente
 router.post('/:id/aceptar', async (req, res) => {
   const client = await pool.connect();
   try {
@@ -103,6 +103,25 @@ router.post('/:id/aceptar', async (req, res) => {
 
     await client.query('BEGIN');
 
+    let proyectoId = cotizacion.proyecto_id;
+
+    // Si esta cotización no tiene un proyecto real todavía, lo creamos ahora
+    // usando el nombre de proyecto que el cliente indicó al ser registrado.
+    if (!proyectoId) {
+      const clienteResult = await client.query('SELECT * FROM clientes WHERE id = $1', [cotizacion.cliente_id]);
+      const cliente = clienteResult.rows[0];
+      const nombreProyecto = (cliente && cliente.nombre_proyecto) ? cliente.nombre_proyecto : `Proyecto de ${cliente ? cliente.nombre : 'cliente'}`;
+
+      const nuevoProyecto = await client.query(
+        'INSERT INTO proyectos (empresa_id, nombre) VALUES ($1, $2) RETURNING *',
+        [cotizacion.empresa_id, nombreProyecto]
+      );
+      proyectoId = nuevoProyecto.rows[0].id;
+
+      // Vinculamos la cotización a este proyecto recién creado
+      await client.query('UPDATE cotizaciones SET proyecto_id = $1 WHERE id = $2', [proyectoId, id]);
+    }
+
     await client.query(
       "UPDATE cotizaciones SET aceptada = TRUE, estado = 'aceptada', updated_at = CURRENT_TIMESTAMP WHERE id = $1",
       [id]
@@ -110,26 +129,86 @@ router.post('/:id/aceptar', async (req, res) => {
 
     const contratoResult = await client.query(
       'INSERT INTO contratos (cotizacion_id, empresa_id, proyecto_id, fecha_entrega, valor_total) VALUES ($1, $2, $3, $4, $5) RETURNING *',
-      [id, cotizacion.empresa_id, cotizacion.proyecto_id, fecha_entrega || null, cotizacion.total]
+      [id, cotizacion.empresa_id, proyectoId, fecha_entrega || null, cotizacion.total]
     );
 
-    // Crear también el registro de estadísticas del proyecto si tiene proyecto asociado
-    if (cotizacion.proyecto_id) {
-      await client.query(
-        'INSERT INTO estadisticas_proyecto (proyecto_id, valor_contrato) VALUES ($1, $2)',
-        [cotizacion.proyecto_id, cotizacion.total]
-      );
-    }
+    await client.query(
+      'INSERT INTO estadisticas_proyecto (proyecto_id, valor_contrato) VALUES ($1, $2)',
+      [proyectoId, cotizacion.total]
+    );
 
     await client.query('COMMIT');
 
-    res.json({ mensaje: 'Cotización aceptada, contrato generado exitosamente', contrato: contratoResult.rows[0] });
+    res.json({ mensaje: 'Cotización aceptada, proyecto y contrato generados exitosamente', contrato: contratoResult.rows[0], proyecto_id: proyectoId });
   } catch (error) {
     await client.query('ROLLBACK');
     console.error('Error aceptando cotización:', error);
     res.status(500).json({ error: 'Error al aceptar cotización' });
   } finally {
     client.release();
+  }
+});
+
+// ✏️ EDITAR cotización (solo si no ha sido aceptada)
+router.put('/:id', async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const { id } = req.params;
+    const { numero, items } = req.body;
+
+    const cotizacionResult = await client.query('SELECT * FROM cotizaciones WHERE id = $1', [id]);
+    if (cotizacionResult.rows.length === 0) {
+      return res.status(404).json({ error: 'Cotización no encontrada' });
+    }
+    if (cotizacionResult.rows[0].aceptada) {
+      return res.status(400).json({ error: 'No se puede editar una cotización ya aceptada' });
+    }
+
+    await client.query('BEGIN');
+
+    if (items && items.length > 0) {
+      const total = items.reduce((sum, item) => sum + parseFloat(item.valor), 0);
+      await client.query('UPDATE cotizaciones SET numero = $1, total = $2, updated_at = CURRENT_TIMESTAMP WHERE id = $3', [numero || null, total, id]);
+
+      await client.query('DELETE FROM cotizacion_items WHERE cotizacion_id = $1', [id]);
+      for (const item of items) {
+        await client.query('INSERT INTO cotizacion_items (cotizacion_id, descripcion, valor) VALUES ($1, $2, $3)', [id, item.descripcion, item.valor]);
+      }
+    } else {
+      await client.query('UPDATE cotizaciones SET numero = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2', [numero || null, id]);
+    }
+
+    await client.query('COMMIT');
+    res.json({ mensaje: 'Cotización actualizada exitosamente' });
+  } catch (error) {
+    await client.query('ROLLBACK');
+    console.error('Error editando cotización:', error);
+    res.status(500).json({ error: 'Error al editar cotización' });
+  } finally {
+    client.release();
+  }
+});
+
+// 🗑️ ELIMINAR cotización (solo si no ha sido aceptada)
+router.delete('/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    const cotizacionResult = await pool.query('SELECT * FROM cotizaciones WHERE id = $1', [id]);
+    if (cotizacionResult.rows.length === 0) {
+      return res.status(404).json({ error: 'Cotización no encontrada' });
+    }
+    if (cotizacionResult.rows[0].aceptada) {
+      return res.status(400).json({ error: 'No se puede eliminar una cotización ya aceptada (ya generó un contrato)' });
+    }
+
+    await pool.query('DELETE FROM cotizacion_items WHERE cotizacion_id = $1', [id]);
+    await pool.query('DELETE FROM cotizaciones WHERE id = $1', [id]);
+
+    res.json({ mensaje: 'Cotización eliminada exitosamente' });
+  } catch (error) {
+    console.error('Error eliminando cotización:', error);
+    res.status(500).json({ error: 'Error al eliminar cotización' });
   }
 });
 // 👁️ LISTAR contratos de una empresa
