@@ -189,6 +189,85 @@ router.put('/:id', async (req, res) => {
   }
 });
 
+// ➕ AGREGAR ítems adicionales a una cotización YA ACEPTADA (ej: el cliente pide adicionales en obra)
+// Recalcula el total de la cotización y lo propaga al contrato y a estadisticas_proyecto.valor_contrato
+router.post('/:id/adicionales', async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const { id } = req.params;
+    const { items } = req.body;
+
+    if (!items || items.length === 0) {
+      return res.status(400).json({ error: 'Debes enviar al menos un ítem adicional' });
+    }
+
+    const cotizacionResult = await client.query('SELECT * FROM cotizaciones WHERE id = $1', [id]);
+    if (cotizacionResult.rows.length === 0) {
+      return res.status(404).json({ error: 'Cotización no encontrada' });
+    }
+    const cotizacion = cotizacionResult.rows[0];
+
+    if (!cotizacion.aceptada) {
+      return res.status(400).json({ error: 'Esta cotización todavía no ha sido aceptada. Para editarla usa la opción Editar.' });
+    }
+
+    await client.query('BEGIN');
+
+    const itemsValidos = items.filter((i) => i.descripcion && i.descripcion.trim() && i.valor);
+    if (itemsValidos.length === 0) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ error: 'Los ítems deben tener descripción y valor' });
+    }
+
+    for (const item of itemsValidos) {
+      await client.query(
+        'INSERT INTO cotizacion_items (cotizacion_id, descripcion, valor, adicional) VALUES ($1, $2, $3, TRUE)',
+        [id, item.descripcion, item.valor]
+      );
+    }
+
+    const totalItemsResult = await client.query(
+      'SELECT COALESCE(SUM(valor), 0) AS total FROM cotizacion_items WHERE cotizacion_id = $1',
+      [id]
+    );
+    const nuevoTotal = parseFloat(totalItemsResult.rows[0].total);
+
+    await client.query(
+      'UPDATE cotizaciones SET total = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2',
+      [nuevoTotal, id]
+    );
+
+    let contratoActualizado = null;
+    if (cotizacion.proyecto_id) {
+      const contratoResult = await client.query(
+        'UPDATE contratos SET valor_total = $1 WHERE proyecto_id = $2 RETURNING *',
+        [nuevoTotal, cotizacion.proyecto_id]
+      );
+      contratoActualizado = contratoResult.rows[0] || null;
+
+      await client.query(
+        'UPDATE estadisticas_proyecto SET valor_contrato = $1, updated_at = CURRENT_TIMESTAMP WHERE proyecto_id = $2',
+        [nuevoTotal, cotizacion.proyecto_id]
+      );
+    }
+
+    await client.query('COMMIT');
+
+    res.json({
+      mensaje: 'Ítems adicionales agregados exitosamente',
+      total: nuevoTotal,
+      contrato: contratoActualizado,
+      proyecto_id: cotizacion.proyecto_id
+    });
+  } catch (error) {
+    await client.query('ROLLBACK');
+    console.error('Error agregando adicionales:', error);
+    res.status(500).json({ error: 'Error al agregar ítems adicionales' });
+  } finally {
+    client.release();
+  }
+});
+
 // 🗑️ ELIMINAR cotización (solo si no ha sido aceptada)
 router.delete('/:id', async (req, res) => {
   try {
