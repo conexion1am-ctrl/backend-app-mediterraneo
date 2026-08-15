@@ -19,25 +19,46 @@ router.get('/', async (req, res) => {
   }
 });
 
-// 👁️ LISTAR personal (usuario_empresa_rol) de una empresa, agrupado
+// 👁️ LISTAR personal de una empresa: vinculados (activos) + pendientes (invitación sin aceptar)
 router.get('/personal/:empresa_id', async (req, res) => {
   try {
     const { empresa_id } = req.params;
-    const result = await pool.query(
-      `SELECT uer.id AS rol_id, u.id AS usuario_id, u.nombre, u.celular, u.foto_url, a.id AS area_id, a.nombre AS area_nombre, a.tipo AS area_tipo
+
+    // Vinculados: ya aceptaron la invitación y están en usuario_empresa_rol
+    const vinculados = await pool.query(
+      `SELECT uer.id AS rol_id, u.id AS usuario_id, u.nombre, u.celular, u.foto_url,
+              a.id AS area_id, a.nombre AS area_nombre, a.tipo AS area_tipo,
+              'vinculado' AS estado
        FROM usuario_empresa_rol uer
        JOIN usuarios u ON u.id = uer.usuario_id
        JOIN areas_catalogo a ON a.id = uer.area_id
-       WHERE uer.empresa_id = $1 AND uer.estado = 'activo'
-       ORDER BY a.nombre, u.nombre`,
+       WHERE uer.empresa_id = $1 AND uer.estado = 'activo'`,
       [empresa_id]
     );
-    res.json({ total: result.rows.length, personal: result.rows });
+
+    // Pendientes: invitación generada pero todavía no aceptada
+    const pendientes = await pool.query(
+      `SELECT i.id AS rol_id, NULL AS usuario_id, i.nombre_invitado AS nombre, i.celular_invitado AS celular, NULL AS foto_url,
+              a.id AS area_id, a.nombre AS area_nombre, a.tipo AS area_tipo,
+              'pendiente' AS estado
+       FROM invitaciones i
+       JOIN areas_catalogo a ON a.id = i.area_id
+       WHERE i.empresa_id = $1 AND i.usado = FALSE`,
+      [empresa_id]
+    );
+
+    const personal = [...vinculados.rows, ...pendientes.rows].sort((a, b) => {
+      if (a.area_nombre !== b.area_nombre) return a.area_nombre.localeCompare(b.area_nombre);
+      return a.nombre.localeCompare(b.nombre);
+    });
+
+    res.json({ total: personal.length, personal });
   } catch (error) {
     console.error('Error listando personal:', error);
     res.status(500).json({ error: 'Error al listar personal' });
   }
 });
+
 // 🔍 VERIFICAR si un celular ya existe en la empresa (evitar duplicados)
 router.get('/verificar-celular/:empresa_id/:celular', async (req, res) => {
   try {
