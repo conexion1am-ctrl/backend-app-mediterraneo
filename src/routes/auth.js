@@ -102,4 +102,60 @@ router.post('/login', async (req, res) => {
   }
 });
 
+// ✏️ EDITAR PERFIL DE USUARIO: nombre y/o contraseña nueva (opcional)
+router.put('/usuario/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { nombre, contraseña_actual, contraseña_nueva } = req.body;
+
+    if (!nombre || !nombre.trim()) {
+      return res.status(400).json({ error: 'El nombre es obligatorio' });
+    }
+
+    const usuarioResult = await pool.query('SELECT * FROM usuarios WHERE id = $1', [id]);
+    if (usuarioResult.rows.length === 0) {
+      return res.status(404).json({ error: 'Usuario no encontrado' });
+    }
+    const usuario = usuarioResult.rows[0];
+
+    let nuevoHash = usuario.contraseña_hash;
+
+    // Si el usuario quiere cambiar la contraseña
+    if (contraseña_nueva) {
+      if (contraseña_nueva.length < 6) {
+        return res.status(400).json({ error: 'La nueva contraseña debe tener al menos 6 caracteres' });
+      }
+
+      // Si ya tenía contraseña configurada, exigimos la actual para confirmar el cambio
+      if (usuario.contraseña_hash) {
+        if (!contraseña_actual) {
+          return res.status(400).json({ error: 'Debes ingresar tu contraseña actual para cambiarla' });
+        }
+        const coincide = await bcrypt.compare(contraseña_actual, usuario.contraseña_hash);
+        if (!coincide) {
+          return res.status(401).json({ error: 'La contraseña actual no es correcta' });
+        }
+      }
+
+      nuevoHash = await bcrypt.hash(contraseña_nueva, 10);
+    }
+
+    const actualizado = await pool.query(
+      'UPDATE usuarios SET nombre = $1, contraseña_hash = $2 WHERE id = $3 RETURNING *',
+      [nombre, nuevoHash, id]
+    );
+
+    const usuarioActualizado = actualizado.rows[0];
+    delete usuarioActualizado.contraseña_hash;
+
+    res.json({
+      mensaje: 'Perfil de usuario actualizado exitosamente',
+      usuario: usuarioActualizado,
+    });
+  } catch (error) {
+    console.error('Error actualizando usuario:', error);
+    res.status(500).json({ error: 'Error al actualizar usuario' });
+  }
+});
+
 module.exports = router;

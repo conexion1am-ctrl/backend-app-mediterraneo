@@ -9,152 +9,112 @@ const pool = new Pool({
   ssl: { rejectUnauthorized: false }
 });
 
-const AREAS_ADMINISTRATIVAS = ['GERENCIA', 'AREA ADMINISTRATIVA', 'AREA DE LOGISTICA'];
-
-// 🔍 PASO 1: verificar celular y saber si necesita contraseña
-router.post('/verificar', async (req, res) => {
+// 📝 CREAR PERFIL: Nueva empresa + usuario Gerencia
+router.post('/crear-perfil', async (req, res) => {
+  const client = await pool.connect();
   try {
-    const { celular } = req.body;
-    if (!celular) {
-      return res.status(400).json({ error: 'celular es obligatorio' });
+    const { nombre_empresa, logo_url, sitio_web, color_hex, nombre_usuario, celular, contraseña } = req.body;
+
+    if (!nombre_empresa || !nombre_usuario || !celular || !contraseña) {
+      return res.status(400).json({ error: 'Nombre de empresa, nombre de usuario, celular y contraseña son obligatorios' });
     }
 
-    const usuarioResult = await pool.query('SELECT * FROM usuarios WHERE celular = $1', [celular]);
-    if (usuarioResult.rows.length === 0) {
-      return res.status(404).json({ error: 'No existe ningún usuario con este número de celular' });
+    if (contraseña.length < 6) {
+      return res.status(400).json({ error: 'La contraseña debe tener al menos 6 caracteres' });
     }
-    const usuario = usuarioResult.rows[0];
 
-    const rolesResult = await pool.query(
-      `SELECT a.nombre AS area_nombre FROM usuario_empresa_rol uer
-       JOIN areas_catalogo a ON a.id = uer.area_id
-       WHERE uer.usuario_id = $1 AND uer.estado = 'activo'`,
-      [usuario.id]
+    await client.query('BEGIN');
+
+    // 1. Crear la empresa
+    const empresaResult = await client.query(
+      'INSERT INTO empresas (nombre, logo_url, sitio_web, color_hex) VALUES ($1, $2, $3, $4) RETURNING *',
+      [nombre_empresa, logo_url || null, sitio_web || null, color_hex || null]
     );
+    const empresa = empresaResult.rows[0];
 
-    const esAdministrativo = rolesResult.rows.some((r) => AREAS_ADMINISTRATIVAS.includes(r.area_nombre));
+    // 2. Encriptar contraseña
+    const contraseñaHash = await bcrypt.hash(contraseña, 10);
 
-    res.json({
-      existe: true,
-      requiere_contraseña: esAdministrativo,
-      nombre: usuario.nombre,
-    });
-  } catch (error) {
-    console.error('Error verificando celular:', error);
-    res.status(500).json({ error: 'Error al verificar celular' });
-  }
-});
-
-// 🔑 PASO 2: login (con o sin contraseña según corresponda)
-router.post('/login', async (req, res) => {
-  try {
-    const { celular, contraseña } = req.body;
-    if (!celular) {
-      return res.status(400).json({ error: 'celular es obligatorio' });
-    }
-
-    const usuarioResult = await pool.query('SELECT * FROM usuarios WHERE celular = $1', [celular]);
-    if (usuarioResult.rows.length === 0) {
-      return res.status(404).json({ error: 'No existe ningún usuario con este número de celular' });
-    }
-    const usuario = usuarioResult.rows[0];
-
-    // Traer todas sus empresas y roles
-    const rolesResult = await pool.query(
-      `SELECT uer.empresa_id, e.nombre AS empresa_nombre, e.logo_url, e.color_hex, e.sitio_web,
-              a.id AS area_id, a.nombre AS area_nombre
-       FROM usuario_empresa_rol uer
-       JOIN empresas e ON e.id = uer.empresa_id
-       JOIN areas_catalogo a ON a.id = uer.area_id
-       WHERE uer.usuario_id = $1 AND uer.estado = 'activo'`,
-      [usuario.id]
-    );
-
-    if (rolesResult.rows.length === 0) {
-      return res.status(404).json({ error: 'Este usuario no pertenece a ninguna empresa activa' });
-    }
-
-    const esAdministrativo = rolesResult.rows.some((r) => AREAS_ADMINISTRATIVAS.includes(r.area_nombre));
-
-    if (esAdministrativo) {
-      if (!contraseña) {
-        return res.status(400).json({ error: 'Este usuario requiere contraseña' });
-      }
+    // 3. Crear o encontrar el usuario (por celular)
+    let usuarioResult = await client.query('SELECT * FROM usuarios WHERE celular = $1', [celular]);
+    let usuario;
+    if (usuarioResult.rows.length > 0) {
+      usuario = usuarioResult.rows[0];
+      // Si ya existía sin contraseña, se la asignamos ahora
       if (!usuario.contraseña_hash) {
-        return res.status(400).json({ error: 'Este usuario no tiene contraseña configurada' });
+        const actualizado = await client.query(
+          'UPDATE usuarios SET contraseña_hash = $1 WHERE id = $2 RETURNING *',
+          [contraseñaHash, usuario.id]
+        );
+        usuario = actualizado.rows[0];
       }
-      const coincide = await bcrypt.compare(contraseña, usuario.contraseña_hash);
-      if (!coincide) {
-        return res.status(401).json({ error: 'Contraseña incorrecta' });
-      }
+    } else {
+      const nuevoUsuario = await client.query(
+        'INSERT INTO usuarios (celular, nombre, contraseña_hash) VALUES ($1, $2, $3) RETURNING *',
+        [celular, nombre_usuario, contraseñaHash]
+      );
+      usuario = nuevoUsuario.rows[0];
     }
 
+    // 4. Buscar el area_id de GERENCIA
+    const areaResult = await client.query("SELECT id FROM areas_catalogo WHERE nombre = 'GERENCIA'");
+    const areaGerenciaId = areaResult.rows[0].id;
+
+    // 5. Vincular usuario a empresa como Gerencia
+    const vinculo = await client.query(
+      'INSERT INTO usuario_empresa_rol (usuario_id, empresa_id, area_id, estado) VALUES ($1, $2, $3, $4) RETURNING *',
+      [usuario.id, empresa.id, areaGerenciaId, 'activo']
+    );
+
+    await client.query('COMMIT');
+
+    // No devolvemos el hash de la contraseña en la respuesta
     delete usuario.contraseña_hash;
 
-    res.json({
-      mensaje: 'Ingreso exitoso',
+    res.status(201).json({
+      mensaje: 'Perfil de empresa creado exitosamente',
+      empresa,
       usuario,
-      empresas: rolesResult.rows,
+      rol: vinculo.rows[0]
     });
   } catch (error) {
-    console.error('Error en login:', error);
-    res.status(500).json({ error: 'Error al iniciar sesión' });
+    await client.query('ROLLBACK');
+    console.error('Error creando perfil de empresa:', error);
+    res.status(500).json({ error: 'Error al crear perfil de empresa' });
+  } finally {
+    client.release();
   }
 });
 
-// ✏️ EDITAR PERFIL DE USUARIO: nombre y/o contraseña nueva (opcional)
-router.put('/usuario/:id', async (req, res) => {
+// ✏️ EDITAR PERFIL DE EMPRESA: nombre, logo, color, sitio web
+router.put('/:id', async (req, res) => {
   try {
     const { id } = req.params;
-    const { nombre, contraseña_actual, contraseña_nueva } = req.body;
+    const { nombre_empresa, logo_url, sitio_web, color_hex } = req.body;
 
-    if (!nombre || !nombre.trim()) {
-      return res.status(400).json({ error: 'El nombre es obligatorio' });
+    if (!nombre_empresa) {
+      return res.status(400).json({ error: 'El nombre de la empresa es obligatorio' });
     }
 
-    const usuarioResult = await pool.query('SELECT * FROM usuarios WHERE id = $1', [id]);
-    if (usuarioResult.rows.length === 0) {
-      return res.status(404).json({ error: 'Usuario no encontrado' });
-    }
-    const usuario = usuarioResult.rows[0];
-
-    let nuevoHash = usuario.contraseña_hash;
-
-    // Si el usuario quiere cambiar la contraseña
-    if (contraseña_nueva) {
-      if (contraseña_nueva.length < 6) {
-        return res.status(400).json({ error: 'La nueva contraseña debe tener al menos 6 caracteres' });
-      }
-
-      // Si ya tenía contraseña configurada, exigimos la actual para confirmar el cambio
-      if (usuario.contraseña_hash) {
-        if (!contraseña_actual) {
-          return res.status(400).json({ error: 'Debes ingresar tu contraseña actual para cambiarla' });
-        }
-        const coincide = await bcrypt.compare(contraseña_actual, usuario.contraseña_hash);
-        if (!coincide) {
-          return res.status(401).json({ error: 'La contraseña actual no es correcta' });
-        }
-      }
-
-      nuevoHash = await bcrypt.hash(contraseña_nueva, 10);
-    }
-
-    const actualizado = await pool.query(
-      'UPDATE usuarios SET nombre = $1, contraseña_hash = $2 WHERE id = $3 RETURNING *',
-      [nombre, nuevoHash, id]
+    const resultado = await pool.query(
+      `UPDATE empresas
+       SET nombre = $1, logo_url = $2, sitio_web = $3, color_hex = $4
+       WHERE id = $5
+       RETURNING *`,
+      [nombre_empresa, logo_url || null, sitio_web || null, color_hex || null, id]
     );
 
-    const usuarioActualizado = actualizado.rows[0];
-    delete usuarioActualizado.contraseña_hash;
+    if (resultado.rows.length === 0) {
+      return res.status(404).json({ error: 'Empresa no encontrada' });
+    }
 
     res.json({
-      mensaje: 'Perfil de usuario actualizado exitosamente',
-      usuario: usuarioActualizado,
+      mensaje: 'Empresa actualizada exitosamente',
+      empresa: resultado.rows[0],
     });
   } catch (error) {
-    console.error('Error actualizando usuario:', error);
-    res.status(500).json({ error: 'Error al actualizar usuario' });
+    console.error('Error actualizando empresa:', error);
+    res.status(500).json({ error: 'Error al actualizar empresa' });
   }
 });
 
