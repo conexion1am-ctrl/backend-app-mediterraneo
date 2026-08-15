@@ -23,6 +23,7 @@ const cotizacionesRoutes = require('./routes/cotizaciones_v2');
 const estadisticasRoutes = require('./routes/estadisticas');
 const areasRoutes = require('./routes/areas');
 const authRoutes = require('./routes/auth');
+const fotosAvanceRoutes = require('./routes/fotos_avance');
 
 // Usar rutas
 app.use('/api/proyectos', proyectosRoutes);
@@ -34,6 +35,7 @@ app.use('/api/cotizaciones', cotizacionesRoutes);
 app.use('/api/estadisticas', estadisticasRoutes);
 app.use('/api/areas', areasRoutes);
 app.use('/api/auth', authRoutes);
+app.use('/api/fotos-avance', fotosAvanceRoutes);
 
 
 // Rutas básicas
