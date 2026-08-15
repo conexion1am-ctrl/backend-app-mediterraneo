@@ -8,18 +8,18 @@ const pool = new Pool({
   ssl: { rejectUnauthorized: false }
 });
 
-// 📝 ENVIAR mensaje en el chat de un área dentro de un proyecto
+// 📝 ENVIAR mensaje en el chat individual de una persona, dentro de un área y un proyecto
 router.post('/enviar', async (req, res) => {
   try {
-    const { proyecto_id, area_id, usuario_id, contenido } = req.body;
+    const { proyecto_id, area_id, usuario_id, destinatario_usuario_id, contenido } = req.body;
 
-    if (!proyecto_id || !area_id || !usuario_id || !contenido) {
-      return res.status(400).json({ error: 'proyecto_id, area_id, usuario_id y contenido son obligatorios' });
+    if (!proyecto_id || !area_id || !usuario_id || !destinatario_usuario_id || !contenido) {
+      return res.status(400).json({ error: 'proyecto_id, area_id, usuario_id, destinatario_usuario_id y contenido son obligatorios' });
     }
 
     const result = await pool.query(
-      'INSERT INTO mensajes (proyecto_id, area_id, usuario_id, contenido) VALUES ($1, $2, $3, $4) RETURNING *',
-      [proyecto_id, area_id, usuario_id, contenido]
+      'INSERT INTO mensajes (proyecto_id, area_id, usuario_id, destinatario_usuario_id, contenido) VALUES ($1, $2, $3, $4, $5) RETURNING *',
+      [proyecto_id, area_id, usuario_id, destinatario_usuario_id, contenido]
     );
 
     res.status(201).json({ mensaje: 'Mensaje enviado exitosamente', data: result.rows[0] });
@@ -29,18 +29,18 @@ router.post('/enviar', async (req, res) => {
   }
 });
 
-// 👁️ VER conversación de un área dentro de un proyecto (con nombre de quien escribió)
-router.get('/:proyecto_id/:area_id', async (req, res) => {
+// 👁️ VER la conversación individual con una persona específica, dentro de un área y proyecto
+router.get('/:proyecto_id/:area_id/:destinatario_usuario_id', async (req, res) => {
   try {
-    const { proyecto_id, area_id } = req.params;
+    const { proyecto_id, area_id, destinatario_usuario_id } = req.params;
 
     const result = await pool.query(
       `SELECT m.id, m.contenido, m.created_at, u.id AS usuario_id, u.nombre AS usuario_nombre
        FROM mensajes m
        JOIN usuarios u ON u.id = m.usuario_id
-       WHERE m.proyecto_id = $1 AND m.area_id = $2
+       WHERE m.proyecto_id = $1 AND m.area_id = $2 AND m.destinatario_usuario_id = $3
        ORDER BY m.created_at ASC`,
-      [proyecto_id, area_id]
+      [proyecto_id, area_id, destinatario_usuario_id]
     );
 
     res.json({ total: result.rows.length, mensajes: result.rows });
