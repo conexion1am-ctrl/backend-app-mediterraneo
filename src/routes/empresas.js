@@ -118,4 +118,45 @@ router.put('/:id', async (req, res) => {
   }
 });
 
+// 🗑️ DESACTIVAR empresa (soft delete): la empresa deja de aparecer para todos sus usuarios,
+// pero toda su información (proyectos, clientes, cotizaciones, etc.) queda intacta en la base de datos.
+// Solo puede hacerlo un usuario con rol GERENCIA en esa empresa.
+router.delete('/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { usuario_id } = req.body;
+
+    if (!usuario_id) {
+      return res.status(400).json({ error: 'usuario_id es obligatorio' });
+    }
+
+    const rolResult = await pool.query(
+      `SELECT uer.*, a.nombre AS area_nombre
+       FROM usuario_empresa_rol uer
+       JOIN areas_catalogo a ON a.id = uer.area_id
+       WHERE uer.usuario_id = $1 AND uer.empresa_id = $2 AND uer.estado = 'activo'`,
+      [usuario_id, id]
+    );
+
+    const esGerencia = rolResult.rows.some((r) => r.area_nombre === 'GERENCIA');
+    if (!esGerencia) {
+      return res.status(403).json({ error: 'Solo un usuario de Gerencia puede eliminar esta empresa' });
+    }
+
+    const resultado = await pool.query(
+      "UPDATE empresas SET estado = 'inactivo' WHERE id = $1 RETURNING *",
+      [id]
+    );
+
+    if (resultado.rows.length === 0) {
+      return res.status(404).json({ error: 'Empresa no encontrada' });
+    }
+
+    res.json({ mensaje: 'Empresa eliminada exitosamente', empresa: resultado.rows[0] });
+  } catch (error) {
+    console.error('Error eliminando empresa:', error);
+    res.status(500).json({ error: 'Error al eliminar la empresa' });
+  }
+});
+
 module.exports = router;

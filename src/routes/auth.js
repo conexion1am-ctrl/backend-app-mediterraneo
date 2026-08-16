@@ -59,14 +59,14 @@ router.post('/login', async (req, res) => {
     }
     const usuario = usuarioResult.rows[0];
 
-    // Traer todas sus empresas y roles
+    // Traer todas sus empresas y roles (solo empresas activas, no eliminadas)
     const rolesResult = await pool.query(
       `SELECT uer.empresa_id, e.nombre AS empresa_nombre, e.logo_url, e.color_hex, e.sitio_web,
               a.id AS area_id, a.nombre AS area_nombre
        FROM usuario_empresa_rol uer
        JOIN empresas e ON e.id = uer.empresa_id
        JOIN areas_catalogo a ON a.id = uer.area_id
-       WHERE uer.usuario_id = $1 AND uer.estado = 'activo'`,
+       WHERE uer.usuario_id = $1 AND uer.estado = 'activo' AND e.estado = 'activo'`,
       [usuario.id]
     );
 
