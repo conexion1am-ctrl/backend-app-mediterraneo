@@ -9,7 +9,8 @@ const pool = new Pool({
   ssl: { rejectUnauthorized: false }
 });
 
-const AREAS_ADMINISTRATIVAS = ['GERENCIA', 'AREA ADMINISTRATIVA', 'AREA DE LOGISTICA'];
+// El login ahora exige contraseña a TODOS los roles por seguridad (antes el personal no
+// administrativo entraba solo con el celular, sin contraseña).
 
 // 🔍 PASO 1: verificar celular y saber si necesita contraseña
 router.post('/verificar', async (req, res) => {
@@ -25,18 +26,13 @@ router.post('/verificar', async (req, res) => {
     }
     const usuario = usuarioResult.rows[0];
 
-    const rolesResult = await pool.query(
-      `SELECT a.nombre AS area_nombre FROM usuario_empresa_rol uer
-       JOIN areas_catalogo a ON a.id = uer.area_id
-       WHERE uer.usuario_id = $1 AND uer.estado = 'activo'`,
-      [usuario.id]
-    );
-
-    const esAdministrativo = rolesResult.rows.some((r) => AREAS_ADMINISTRATIVAS.includes(r.area_nombre));
-
     res.json({
       existe: true,
-      requiere_contraseña: esAdministrativo,
+      requiere_contraseña: true,
+      // Si es la primera vez que este usuario usa contraseña (personas que se vincularon antes
+      // de que se exigiera contraseña a todos los roles), le dejamos crear una en vez de pedirle
+      // una que nunca configuró.
+      debe_crear_contraseña: !usuario.contraseña_hash,
       nombre: usuario.nombre,
     });
   } catch (error) {
@@ -74,26 +70,34 @@ router.post('/login', async (req, res) => {
       return res.status(404).json({ error: 'Este usuario no pertenece a ninguna empresa activa' });
     }
 
-    const esAdministrativo = rolesResult.rows.some((r) => AREAS_ADMINISTRATIVAS.includes(r.area_nombre));
+    // Todos los roles requieren contraseña (antes solo Gerencia/Administrativa/Logística).
+    if (!contraseña || contraseña.length < 6) {
+      return res.status(400).json({ error: 'Este usuario requiere una contraseña de al menos 6 caracteres' });
+    }
 
-    if (esAdministrativo) {
-      if (!contraseña) {
-        return res.status(400).json({ error: 'Este usuario requiere contraseña' });
-      }
-      if (!usuario.contraseña_hash) {
-        return res.status(400).json({ error: 'Este usuario no tiene contraseña configurada' });
-      }
+    let usuarioFinal = usuario;
+    if (!usuario.contraseña_hash) {
+      // Primera vez que este usuario usa contraseña (se vinculó antes de que fuera obligatoria
+      // para todos los roles): la que envía ahora queda guardada como su nueva contraseña.
+      const hash = await bcrypt.hash(contraseña, 10);
+      const actualizado = await pool.query(
+        'UPDATE usuarios SET contraseña_hash = $1 WHERE id = $2 RETURNING *',
+        [hash, usuario.id]
+      );
+      usuarioFinal = actualizado.rows[0];
+    } else {
       const coincide = await bcrypt.compare(contraseña, usuario.contraseña_hash);
       if (!coincide) {
         return res.status(401).json({ error: 'Contraseña incorrecta' });
       }
     }
 
-    delete usuario.contraseña_hash;
+    delete usuarioFinal.contraseña_hash;
+    const usuarioRespuesta = usuarioFinal;
 
     res.json({
       mensaje: 'Ingreso exitoso',
-      usuario,
+      usuario: usuarioRespuesta,
       empresas: rolesResult.rows,
     });
   } catch (error) {
@@ -155,6 +159,27 @@ router.put('/usuario/:id', async (req, res) => {
   } catch (error) {
     console.error('Error actualizando usuario:', error);
     res.status(500).json({ error: 'Error al actualizar usuario' });
+  }
+});
+
+// 🔔 GUARDAR/ACTUALIZAR el token de notificaciones push de este usuario en este dispositivo.
+// Se llama cada vez que la app abre sesión (login o restaurar sesión guardada), así siempre
+// queda el token del último dispositivo donde el usuario entró.
+router.put('/usuario/:id/push-token', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { push_token } = req.body;
+
+    if (!push_token) {
+      return res.status(400).json({ error: 'push_token es obligatorio' });
+    }
+
+    await pool.query('UPDATE usuarios SET push_token = $1 WHERE id = $2', [push_token, id]);
+
+    res.json({ mensaje: 'Token de notificaciones guardado exitosamente' });
+  } catch (error) {
+    console.error('Error guardando push token:', error);
+    res.status(500).json({ error: 'Error al guardar el token de notificaciones' });
   }
 });
 

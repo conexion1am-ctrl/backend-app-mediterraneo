@@ -12,7 +12,7 @@ const pool = new Pool({
 router.post('/crear', async (req, res) => {
   const client = await pool.connect();
   try {
-    const { empresa_id, cliente_id, proyecto_id, numero, items } = req.body;
+    const { empresa_id, cliente_id, proyecto_id, numero, items, descuento } = req.body;
 
     if (!empresa_id || !cliente_id || !items || items.length === 0) {
       return res.status(400).json({ error: 'empresa_id, cliente_id e items son obligatorios' });
@@ -20,18 +20,19 @@ router.post('/crear', async (req, res) => {
 
     await client.query('BEGIN');
 
-    const total = items.reduce((sum, item) => sum + parseFloat(item.valor), 0);
+    const subtotal = items.reduce((sum, item) => sum + parseFloat(item.valor), 0);
+    const total = subtotal - (parseFloat(descuento) || 0);
 
     const cotizacionResult = await client.query(
-      'INSERT INTO cotizaciones (empresa_id, cliente_id, proyecto_id, numero, total) VALUES ($1, $2, $3, $4, $5) RETURNING *',
-      [empresa_id, cliente_id, proyecto_id || null, numero || null, total]
+      'INSERT INTO cotizaciones (empresa_id, cliente_id, proyecto_id, numero, total, descuento) VALUES ($1, $2, $3, $4, $5, $6) RETURNING *',
+      [empresa_id, cliente_id, proyecto_id || null, numero || null, total, parseFloat(descuento) || 0]
     );
     const cotizacion = cotizacionResult.rows[0];
 
     for (const item of items) {
       await client.query(
-        'INSERT INTO cotizacion_items (cotizacion_id, descripcion, valor) VALUES ($1, $2, $3)',
-        [cotizacion.id, item.descripcion, item.valor]
+        'INSERT INTO cotizacion_items (cotizacion_id, descripcion, cantidad, valor, seccion) VALUES ($1, $2, $3, $4, $5)',
+        [cotizacion.id, item.descripcion, item.cantidad || null, item.valor, item.seccion || null]
       );
     }
 
@@ -154,7 +155,7 @@ router.put('/:id', async (req, res) => {
   const client = await pool.connect();
   try {
     const { id } = req.params;
-    const { numero, items } = req.body;
+    const { numero, items, descuento } = req.body;
 
     const cotizacionResult = await client.query('SELECT * FROM cotizaciones WHERE id = $1', [id]);
     if (cotizacionResult.rows.length === 0) {
@@ -167,12 +168,13 @@ router.put('/:id', async (req, res) => {
     await client.query('BEGIN');
 
     if (items && items.length > 0) {
-      const total = items.reduce((sum, item) => sum + parseFloat(item.valor), 0);
-      await client.query('UPDATE cotizaciones SET numero = $1, total = $2, updated_at = CURRENT_TIMESTAMP WHERE id = $3', [numero || null, total, id]);
+      const subtotal = items.reduce((sum, item) => sum + parseFloat(item.valor), 0);
+      const total = subtotal - (parseFloat(descuento) || 0);
+      await client.query('UPDATE cotizaciones SET numero = $1, total = $2, descuento = $3, updated_at = CURRENT_TIMESTAMP WHERE id = $4', [numero || null, total, parseFloat(descuento) || 0, id]);
 
       await client.query('DELETE FROM cotizacion_items WHERE cotizacion_id = $1', [id]);
       for (const item of items) {
-        await client.query('INSERT INTO cotizacion_items (cotizacion_id, descripcion, valor) VALUES ($1, $2, $3)', [id, item.descripcion, item.valor]);
+        await client.query('INSERT INTO cotizacion_items (cotizacion_id, descripcion, cantidad, valor, seccion) VALUES ($1, $2, $3, $4, $5)', [id, item.descripcion, item.cantidad || null, item.valor, item.seccion || null]);
       }
     } else {
       await client.query('UPDATE cotizaciones SET numero = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2', [numero || null, id]);
@@ -221,8 +223,8 @@ router.post('/:id/adicionales', async (req, res) => {
 
     for (const item of itemsValidos) {
       await client.query(
-        'INSERT INTO cotizacion_items (cotizacion_id, descripcion, valor, adicional) VALUES ($1, $2, $3, TRUE)',
-        [id, item.descripcion, item.valor]
+        'INSERT INTO cotizacion_items (cotizacion_id, descripcion, cantidad, valor, adicional, seccion) VALUES ($1, $2, $3, $4, TRUE, $5)',
+        [id, item.descripcion, item.cantidad || null, item.valor, item.seccion || null]
       );
     }
 
@@ -275,7 +277,7 @@ router.put('/:id/items-aceptada', async (req, res) => {
   const client = await pool.connect();
   try {
     const { id } = req.params;
-    const { items } = req.body;
+    const { items, descuento } = req.body;
 
     if (!items || items.length === 0) {
       return res.status(400).json({ error: 'Debes enviar al menos un ítem' });
@@ -303,16 +305,18 @@ router.put('/:id/items-aceptada', async (req, res) => {
     await client.query('DELETE FROM cotizacion_items WHERE cotizacion_id = $1', [id]);
     for (const item of itemsValidos) {
       await client.query(
-        'INSERT INTO cotizacion_items (cotizacion_id, descripcion, valor, adicional) VALUES ($1, $2, $3, $4)',
-        [id, item.descripcion, item.valor, !!item.adicional]
+        'INSERT INTO cotizacion_items (cotizacion_id, descripcion, cantidad, valor, adicional, seccion) VALUES ($1, $2, $3, $4, $5, $6)',
+        [id, item.descripcion, item.cantidad || null, item.valor, !!item.adicional, item.seccion || null]
       );
     }
 
-    const nuevoTotal = itemsValidos.reduce((sum, item) => sum + parseFloat(item.valor), 0);
+    const subtotal = itemsValidos.reduce((sum, item) => sum + parseFloat(item.valor), 0);
+    const descuentoAplicado = descuento !== undefined ? (parseFloat(descuento) || 0) : parseFloat(cotizacion.descuento) || 0;
+    const nuevoTotal = subtotal - descuentoAplicado;
 
     await client.query(
-      'UPDATE cotizaciones SET total = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2',
-      [nuevoTotal, id]
+      'UPDATE cotizaciones SET total = $1, descuento = $2, updated_at = CURRENT_TIMESTAMP WHERE id = $3',
+      [nuevoTotal, descuentoAplicado, id]
     );
 
     let contratoActualizado = null;

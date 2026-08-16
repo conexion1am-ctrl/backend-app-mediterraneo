@@ -9,6 +9,9 @@ const pool = new Pool({
   ssl: { rejectUnauthorized: false }
 });
 
+// Lista histórica de áreas administrativas. Ya no se usa para decidir si se pide contraseña:
+// ahora TODAS las áreas la requieren al aceptar una invitación (antes el personal de campo
+// entraba solo con el celular, sin contraseña).
 const AREAS_ADMINISTRATIVAS = ['GERENCIA', 'AREA ADMINISTRATIVA', 'AREA DE LOGISTICA'];
 
 // 📝 GENERAR invitación (agregar personal desde Grupo de Trabajo)
@@ -86,12 +89,9 @@ router.post('/aceptar/:token', async (req, res) => {
       return res.status(400).json({ error: 'Esta invitación ya fue utilizada' });
     }
 
-    const esAdministrativa = AREAS_ADMINISTRATIVAS.includes(invitacion.area_nombre);
-
-    if (esAdministrativa) {
-      if (!contraseña || contraseña.length < 6) {
-        return res.status(400).json({ error: 'Esta área requiere una contraseña de al menos 6 caracteres' });
-      }
+    // Todas las áreas requieren contraseña al aceptar la invitación (antes solo las administrativas).
+    if (!contraseña || contraseña.length < 6) {
+      return res.status(400).json({ error: 'Debes crear una contraseña de al menos 6 caracteres' });
     }
 
     await client.query('BEGIN');
@@ -101,7 +101,7 @@ router.post('/aceptar/:token', async (req, res) => {
 
     if (usuarioResult.rows.length > 0) {
       usuario = usuarioResult.rows[0];
-      if (esAdministrativa && !usuario.contraseña_hash) {
+      if (!usuario.contraseña_hash) {
         const hash = await bcrypt.hash(contraseña, 10);
         const actualizado = await client.query(
           'UPDATE usuarios SET contraseña_hash = $1 WHERE id = $2 RETURNING *',
@@ -110,10 +110,7 @@ router.post('/aceptar/:token', async (req, res) => {
         usuario = actualizado.rows[0];
       }
     } else {
-      let contraseñaHash = null;
-      if (esAdministrativa) {
-        contraseñaHash = await bcrypt.hash(contraseña, 10);
-      }
+      const contraseñaHash = await bcrypt.hash(contraseña, 10);
       const nuevoUsuario = await client.query(
         'INSERT INTO usuarios (celular, nombre, contraseña_hash) VALUES ($1, $2, $3) RETURNING *',
         [invitacion.celular_invitado, invitacion.nombre_invitado, contraseñaHash]
