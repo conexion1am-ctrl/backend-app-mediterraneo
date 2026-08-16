@@ -66,6 +66,36 @@ router.get('/:token', async (req, res) => {
   }
 });
 
+// 👁️ VER el link de una invitación existente por su id (para reenviarla desde Grupo de Trabajo
+// cuando una persona sigue "pendiente" y quizás no se le reenvió el link a tiempo)
+router.get('/id/:id/link', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const result = await pool.query(
+      `SELECT i.*, a.nombre AS area_nombre
+       FROM invitaciones i
+       JOIN areas_catalogo a ON a.id = i.area_id
+       WHERE i.id = $1`,
+      [id]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Invitación no encontrada' });
+    }
+
+    const invitacion = result.rows[0];
+    if (invitacion.usado) {
+      return res.status(400).json({ error: 'Esta invitación ya fue aceptada' });
+    }
+
+    const link = `frontendappmedv2://invitacion/${invitacion.token}`;
+    res.json({ invitacion, link_whatsapp: link });
+  } catch (error) {
+    console.error('Error obteniendo link de invitación:', error);
+    res.status(500).json({ error: 'Error al obtener el link de invitación' });
+  }
+});
+
 // ✅ ACEPTAR invitación (vincula al usuario con la empresa y área)
 router.post('/aceptar/:token', async (req, res) => {
   const client = await pool.connect();
