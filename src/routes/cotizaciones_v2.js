@@ -268,6 +268,84 @@ router.post('/:id/adicionales', async (req, res) => {
   }
 });
 
+// ✏️ EDITAR ítems de una cotización YA ACEPTADA (el cliente pide cambiar cantidades, valores o
+// quitar/agregar ítems mientras la obra está en curso). Reemplaza la lista completa de ítems,
+// recalcula el total y propaga el nuevo valor al contrato y a las estadísticas del proyecto.
+router.put('/:id/items-aceptada', async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const { id } = req.params;
+    const { items } = req.body;
+
+    if (!items || items.length === 0) {
+      return res.status(400).json({ error: 'Debes enviar al menos un ítem' });
+    }
+
+    const cotizacionResult = await client.query('SELECT * FROM cotizaciones WHERE id = $1', [id]);
+    if (cotizacionResult.rows.length === 0) {
+      return res.status(404).json({ error: 'Cotización no encontrada' });
+    }
+    const cotizacion = cotizacionResult.rows[0];
+
+    if (!cotizacion.aceptada) {
+      return res.status(400).json({ error: 'Esta cotización todavía no ha sido aceptada. Para editarla usa la opción Editar normal.' });
+    }
+
+    const itemsValidos = items.filter((i) => i.descripcion && i.descripcion.trim() && i.valor);
+    if (itemsValidos.length === 0) {
+      return res.status(400).json({ error: 'Los ítems deben tener descripción y valor' });
+    }
+
+    await client.query('BEGIN');
+
+    // Reemplazamos todos los ítems por la lista editada (ya incluye los que se conservaron,
+    // los que se modificaron y los nuevos que se hayan agregado en esta edición).
+    await client.query('DELETE FROM cotizacion_items WHERE cotizacion_id = $1', [id]);
+    for (const item of itemsValidos) {
+      await client.query(
+        'INSERT INTO cotizacion_items (cotizacion_id, descripcion, valor, adicional) VALUES ($1, $2, $3, $4)',
+        [id, item.descripcion, item.valor, !!item.adicional]
+      );
+    }
+
+    const nuevoTotal = itemsValidos.reduce((sum, item) => sum + parseFloat(item.valor), 0);
+
+    await client.query(
+      'UPDATE cotizaciones SET total = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2',
+      [nuevoTotal, id]
+    );
+
+    let contratoActualizado = null;
+    if (cotizacion.proyecto_id) {
+      const contratoResult = await client.query(
+        'UPDATE contratos SET valor_total = $1 WHERE proyecto_id = $2 RETURNING *',
+        [nuevoTotal, cotizacion.proyecto_id]
+      );
+      contratoActualizado = contratoResult.rows[0] || null;
+
+      await client.query(
+        'UPDATE estadisticas_proyecto SET valor_contrato = $1, updated_at = CURRENT_TIMESTAMP WHERE proyecto_id = $2',
+        [nuevoTotal, cotizacion.proyecto_id]
+      );
+    }
+
+    await client.query('COMMIT');
+
+    res.json({
+      mensaje: 'Cotización actualizada exitosamente',
+      total: nuevoTotal,
+      contrato: contratoActualizado,
+      proyecto_id: cotizacion.proyecto_id
+    });
+  } catch (error) {
+    await client.query('ROLLBACK');
+    console.error('Error editando ítems de cotización aceptada:', error);
+    res.status(500).json({ error: 'Error al editar la cotización' });
+  } finally {
+    client.release();
+  }
+});
+
 // 🗑️ ELIMINAR cotización (solo si no ha sido aceptada)
 router.delete('/:id', async (req, res) => {
   try {
@@ -295,10 +373,10 @@ router.get('/contratos/listar/:empresa_id', async (req, res) => {
   try {
     const { empresa_id } = req.params;
     const result = await pool.query(
-      `SELECT ct.*, p.nombre AS proyecto_nombre 
-       FROM contratos ct 
-       LEFT JOIN proyectos p ON p.id = ct.proyecto_id 
-       WHERE ct.empresa_id = $1 
+      `SELECT ct.*, p.nombre AS proyecto_nombre, p.estado AS proyecto_estado
+       FROM contratos ct
+       LEFT JOIN proyectos p ON p.id = ct.proyecto_id
+       WHERE ct.empresa_id = $1
        ORDER BY ct.created_at DESC`,
       [empresa_id]
     );
