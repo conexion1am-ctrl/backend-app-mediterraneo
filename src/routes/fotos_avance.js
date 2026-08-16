@@ -2,6 +2,7 @@ const express = require('express');
 const { Pool } = require('pg');
 const router = express.Router();
 require('dotenv').config();
+const { borrarArchivoDeStorage } = require('../utils/firebaseAdmin');
 
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
@@ -48,7 +49,8 @@ router.get('/:proyecto_id/:area_id', async (req, res) => {
   }
 });
 
-// 🗑️ ELIMINAR una foto de avance (solo la referencia en la base de datos)
+// 🗑️ ELIMINAR una foto de avance: borra la fila y también el archivo real en Firebase Storage,
+// para no dejar el archivo huérfano ocupando espacio en la nube.
 router.delete('/:id', async (req, res) => {
   try {
     const { id } = req.params;
@@ -57,6 +59,8 @@ router.delete('/:id', async (req, res) => {
     if (result.rows.length === 0) {
       return res.status(404).json({ error: 'Foto no encontrada' });
     }
+
+    await borrarArchivoDeStorage(result.rows[0].foto_url);
 
     res.json({ mensaje: 'Foto eliminada exitosamente' });
   } catch (error) {

@@ -2,6 +2,8 @@ const express = require('express');
 const { Pool } = require('pg');
 const router = express.Router();
 require('dotenv').config();
+const { areaDeUsuarioEnEmpresa, puedeEliminarClientes } = require('../utils/permisos');
+const { borrarArchivoDeStorage } = require('../utils/firebaseAdmin');
 
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
@@ -55,14 +57,33 @@ router.put('/:id', async (req, res) => {
   }
 });
 
-// 🗑️ ELIMINAR cliente
+// 🗑️ ELIMINAR cliente. Área Comercial y Logística no tienen permiso para eliminar clientes
+// (solo pueden verlos/agregarlos); esta validación evita que se salte ocultando el botón.
 router.delete('/:id', async (req, res) => {
   try {
     const { id } = req.params;
+    const { usuario_id } = req.body;
+
+    const clienteResult = await pool.query('SELECT empresa_id, contrato_url FROM clientes WHERE id = $1', [id]);
+    if (clienteResult.rows.length === 0) {
+      return res.status(404).json({ error: 'Cliente no encontrado' });
+    }
+
+    if (usuario_id) {
+      const areaNombre = await areaDeUsuarioEnEmpresa(usuario_id, clienteResult.rows[0].empresa_id);
+      if (!puedeEliminarClientes(areaNombre)) {
+        return res.status(403).json({ error: 'Tu área no tiene permiso para eliminar clientes' });
+      }
+    }
+
     const result = await pool.query('DELETE FROM clientes WHERE id = $1 RETURNING *', [id]);
 
     if (result.rows.length === 0) {
       return res.status(404).json({ error: 'Cliente no encontrado' });
+    }
+
+    if (clienteResult.rows[0].contrato_url) {
+      await borrarArchivoDeStorage(clienteResult.rows[0].contrato_url);
     }
 
     res.json({ mensaje: 'Cliente eliminado exitosamente' });

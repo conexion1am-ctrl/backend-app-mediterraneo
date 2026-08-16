@@ -8,6 +8,7 @@ const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: { rejectUnauthorized: false }
 });
+const { esGerencia } = require('../utils/permisos');
 
 // 📝 CREAR PERFIL: Nueva empresa + usuario Gerencia
 router.post('/crear-perfil', async (req, res) => {
@@ -87,13 +88,21 @@ router.post('/crear-perfil', async (req, res) => {
 });
 
 // ✏️ EDITAR PERFIL DE EMPRESA: nombre, logo, color, sitio web
+// Editar datos de empresa (logo, nombre, sitio web, color): solo Gerencia puede hacerlo.
 router.put('/:id', async (req, res) => {
   try {
     const { id } = req.params;
-    const { nombre_empresa, logo_url, sitio_web, color_hex } = req.body;
+    const { nombre_empresa, logo_url, sitio_web, color_hex, solicitante_id } = req.body;
 
     if (!nombre_empresa) {
       return res.status(400).json({ error: 'El nombre de la empresa es obligatorio' });
+    }
+
+    if (solicitante_id) {
+      const esGerenciaDeEstaEmpresa = await esGerencia(solicitante_id, id);
+      if (!esGerenciaDeEstaEmpresa) {
+        return res.status(403).json({ error: 'Solo Gerencia puede editar los datos de la empresa' });
+      }
     }
 
     const resultado = await pool.query(

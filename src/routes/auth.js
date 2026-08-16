@@ -58,7 +58,7 @@ router.post('/login', async (req, res) => {
     // Traer todas sus empresas y roles (solo empresas activas, no eliminadas)
     const rolesResult = await pool.query(
       `SELECT uer.empresa_id, e.nombre AS empresa_nombre, e.logo_url, e.color_hex, e.sitio_web,
-              a.id AS area_id, a.nombre AS area_nombre
+              a.id AS area_id, a.nombre AS area_nombre, a.tipo AS area_tipo
        FROM usuario_empresa_rol uer
        JOIN empresas e ON e.id = uer.empresa_id
        JOIN areas_catalogo a ON a.id = uer.area_id
@@ -159,6 +159,25 @@ router.put('/usuario/:id', async (req, res) => {
   } catch (error) {
     console.error('Error actualizando usuario:', error);
     res.status(500).json({ error: 'Error al actualizar usuario' });
+  }
+});
+
+// 👁️ VER los datos propios de un usuario: nombre y su documento ARL (solo lectura, para la
+// pantalla "Mi Perfil" reducida de mano de obra). No incluye la contraseña.
+router.get('/usuario/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const result = await pool.query(
+      'SELECT id, nombre, celular, foto_url, arl_documento_url, arl_vencimiento FROM usuarios WHERE id = $1',
+      [id]
+    );
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Usuario no encontrado' });
+    }
+    res.json(result.rows[0]);
+  } catch (error) {
+    console.error('Error obteniendo usuario:', error);
+    res.status(500).json({ error: 'Error al obtener usuario' });
   }
 });
 

@@ -2,6 +2,8 @@ const express = require('express');
 const { Pool } = require('pg');
 const router = express.Router();
 require('dotenv').config();
+const { areaDeUsuarioEnEmpresa } = require('../utils/permisos');
+const { borrarArchivoDeStorage } = require('../utils/firebaseAdmin');
 
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
@@ -107,13 +109,23 @@ router.get('/verificar-celular/:empresa_id/:celular', async (req, res) => {
 });
 
 // ✏️ EDITAR nombre de una persona VINCULADA (afecta todas sus áreas, el nombre vive en usuarios)
+// Solo alguien de GERENCIA puede editar a otra persona de GERENCIA (evita que Administrativa,
+// por ejemplo, edite los datos del dueño de la empresa).
 router.put('/personal/vinculado/:usuario_id/nombre', async (req, res) => {
   try {
     const { usuario_id } = req.params;
-    const { nombre } = req.body;
+    const { nombre, empresa_id, solicitante_id } = req.body;
 
     if (!nombre || !nombre.trim()) {
       return res.status(400).json({ error: 'El nombre es obligatorio' });
+    }
+
+    if (empresa_id && solicitante_id) {
+      const areaObjetivo = await areaDeUsuarioEnEmpresa(usuario_id, empresa_id);
+      const areaSolicitante = await areaDeUsuarioEnEmpresa(solicitante_id, empresa_id);
+      if (areaObjetivo === 'GERENCIA' && areaSolicitante !== 'GERENCIA') {
+        return res.status(403).json({ error: 'Solo Gerencia puede editar a otra persona de Gerencia' });
+      }
     }
 
     const result = await pool.query('UPDATE usuarios SET nombre = $1 WHERE id = $2 RETURNING *', [nombre, usuario_id]);
@@ -133,10 +145,18 @@ router.put('/personal/vinculado/:usuario_id/nombre', async (req, res) => {
 router.post('/personal/vinculado/:usuario_id/areas', async (req, res) => {
   try {
     const { usuario_id } = req.params;
-    const { empresa_id, area_id } = req.body;
+    const { empresa_id, area_id, solicitante_id } = req.body;
 
     if (!empresa_id || !area_id) {
       return res.status(400).json({ error: 'empresa_id y area_id son obligatorios' });
+    }
+
+    if (solicitante_id) {
+      const areaObjetivo = await areaDeUsuarioEnEmpresa(usuario_id, empresa_id);
+      const areaSolicitante = await areaDeUsuarioEnEmpresa(solicitante_id, empresa_id);
+      if (areaObjetivo === 'GERENCIA' && areaSolicitante !== 'GERENCIA') {
+        return res.status(403).json({ error: 'Solo Gerencia puede editar a otra persona de Gerencia' });
+      }
     }
 
     const existe = await pool.query(
@@ -164,13 +184,23 @@ router.delete('/personal/vinculado/:rol_id', async (req, res) => {
   try {
     const { rol_id } = req.params;
     const { todas } = req.query; // ?todas=true para desactivar TODAS sus áreas en la empresa
+    const { solicitante_id } = req.body;
+
+    const rolActual = await pool.query('SELECT * FROM usuario_empresa_rol WHERE id = $1', [rol_id]);
+    if (rolActual.rows.length === 0) {
+      return res.status(404).json({ error: 'Registro no encontrado' });
+    }
+    const { usuario_id, empresa_id } = rolActual.rows[0];
+
+    if (solicitante_id) {
+      const areaObjetivo = await areaDeUsuarioEnEmpresa(usuario_id, empresa_id);
+      const areaSolicitante = await areaDeUsuarioEnEmpresa(solicitante_id, empresa_id);
+      if (areaObjetivo === 'GERENCIA' && areaSolicitante !== 'GERENCIA') {
+        return res.status(403).json({ error: 'Solo Gerencia puede eliminar a otra persona de Gerencia' });
+      }
+    }
 
     if (todas === 'true') {
-      const rolActual = await pool.query('SELECT * FROM usuario_empresa_rol WHERE id = $1', [rol_id]);
-      if (rolActual.rows.length === 0) {
-        return res.status(404).json({ error: 'Registro no encontrado' });
-      }
-      const { usuario_id, empresa_id } = rolActual.rows[0];
       await pool.query(
         `UPDATE usuario_empresa_rol SET estado = 'inactivo' WHERE usuario_id = $1 AND empresa_id = $2`,
         [usuario_id, empresa_id]
@@ -195,8 +225,9 @@ router.delete('/personal/vinculado/:rol_id', async (req, res) => {
 });
 
 // 📄 SUBIR/ACTUALIZAR documento ARL (riesgos profesionales) de una persona vinculada.
-// El archivo ya fue subido a Firebase Storage desde el frontend; aquí solo se guarda la
-// referencia (url) y la fecha de vencimiento para poder avisar si ya expiró.
+// El archivo ya fue subido a Firebase Storage desde el frontend; aquí se guarda la referencia
+// (url) y la fecha de vencimiento, y se borra de Storage el documento anterior (si había uno)
+// para no dejarlo huérfano ocupando espacio.
 router.put('/personal/vinculado/:usuario_id/arl', async (req, res) => {
   try {
     const { usuario_id } = req.params;
@@ -206,6 +237,8 @@ router.put('/personal/vinculado/:usuario_id/arl', async (req, res) => {
       return res.status(400).json({ error: 'arl_documento_url es obligatorio' });
     }
 
+    const anterior = await pool.query('SELECT arl_documento_url FROM usuarios WHERE id = $1', [usuario_id]);
+
     const result = await pool.query(
       'UPDATE usuarios SET arl_documento_url = $1, arl_vencimiento = $2 WHERE id = $3 RETURNING *',
       [arl_documento_url, arl_vencimiento || null, usuario_id]
@@ -213,6 +246,10 @@ router.put('/personal/vinculado/:usuario_id/arl', async (req, res) => {
 
     if (result.rows.length === 0) {
       return res.status(404).json({ error: 'Persona no encontrada' });
+    }
+
+    if (anterior.rows[0]?.arl_documento_url && anterior.rows[0].arl_documento_url !== arl_documento_url) {
+      await borrarArchivoDeStorage(anterior.rows[0].arl_documento_url);
     }
 
     const usuario = result.rows[0];
@@ -225,10 +262,13 @@ router.put('/personal/vinculado/:usuario_id/arl', async (req, res) => {
   }
 });
 
-// 🗑️ ELIMINAR documento ARL de una persona (por si se subió por error o hay que reemplazarlo)
+// 🗑️ ELIMINAR documento ARL de una persona (por si se subió por error o hay que reemplazarlo):
+// borra la referencia y también el archivo real en Firebase Storage.
 router.delete('/personal/vinculado/:usuario_id/arl', async (req, res) => {
   try {
     const { usuario_id } = req.params;
+
+    const anterior = await pool.query('SELECT arl_documento_url FROM usuarios WHERE id = $1', [usuario_id]);
 
     const result = await pool.query(
       'UPDATE usuarios SET arl_documento_url = NULL, arl_vencimiento = NULL WHERE id = $1 RETURNING *',
@@ -237,6 +277,10 @@ router.delete('/personal/vinculado/:usuario_id/arl', async (req, res) => {
 
     if (result.rows.length === 0) {
       return res.status(404).json({ error: 'Persona no encontrada' });
+    }
+
+    if (anterior.rows[0]?.arl_documento_url) {
+      await borrarArchivoDeStorage(anterior.rows[0].arl_documento_url);
     }
 
     res.json({ mensaje: 'Documento ARL eliminado exitosamente' });

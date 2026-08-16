@@ -2,17 +2,34 @@ const express = require('express');
 const { Pool } = require('pg');
 const router = express.Router();
 require('dotenv').config();
+const { generarPdfBuffer } = require('../utils/generarPdf');
+const { subirBufferAStorage, borrarArchivoDeStorage } = require('../utils/firebaseAdmin');
+const { esGerencia } = require('../utils/permisos');
 
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: { rejectUnauthorized: false }
 });
 
+// Valores por defecto de los campos "estándar" de la carta (editables por el usuario al crear
+// la cotización, pero precargados para no empezar desde cero cada vez).
+const PARRAFO_CONTEXTO_DEFECTO = 'Por solicitud efectuada paso a cotizar los precios del Kit de acabados completos para su casa';
+const TIEMPO_ENTREGA_DEFECTO = '12 - 14 Semanas';
+const CONDICIONES_PAGO_DEFECTO = [
+  { porcentaje: 25, descripcion: 'A la firma del contrato para el inicio de actividades' },
+  { porcentaje: 25, descripcion: 'A las 3-4 semanas con avance' },
+  { porcentaje: 25, descripcion: 'A la entrega de la obra blanca' },
+  { porcentaje: 25, descripcion: 'A la entrega final de la obra, incluyendo carpintería' },
+];
+
 // 📝 CREAR cotización con sus ítems
 router.post('/crear', async (req, res) => {
   const client = await pool.connect();
   try {
-    const { empresa_id, cliente_id, proyecto_id, numero, items, descuento } = req.body;
+    const {
+      empresa_id, cliente_id, proyecto_id, numero, items, descuento,
+      propietario, ciudad, parrafo_contexto, condiciones_pago, tiempo_entrega, firmante,
+    } = req.body;
 
     if (!empresa_id || !cliente_id || !items || items.length === 0) {
       return res.status(400).json({ error: 'empresa_id, cliente_id e items son obligatorios' });
@@ -24,8 +41,18 @@ router.post('/crear', async (req, res) => {
     const total = subtotal - (parseFloat(descuento) || 0);
 
     const cotizacionResult = await client.query(
-      'INSERT INTO cotizaciones (empresa_id, cliente_id, proyecto_id, numero, total, descuento) VALUES ($1, $2, $3, $4, $5, $6) RETURNING *',
-      [empresa_id, cliente_id, proyecto_id || null, numero || null, total, parseFloat(descuento) || 0]
+      `INSERT INTO cotizaciones
+        (empresa_id, cliente_id, proyecto_id, numero, total, descuento,
+         propietario, ciudad, parrafo_contexto, condiciones_pago, tiempo_entrega, firmante)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) RETURNING *`,
+      [
+        empresa_id, cliente_id, proyecto_id || null, numero || null, total, parseFloat(descuento) || 0,
+        propietario || null, ciudad || null,
+        parrafo_contexto || PARRAFO_CONTEXTO_DEFECTO,
+        JSON.stringify(condiciones_pago && condiciones_pago.length ? condiciones_pago : CONDICIONES_PAGO_DEFECTO),
+        tiempo_entrega || TIEMPO_ENTREGA_DEFECTO,
+        firmante || null,
+      ]
     );
     const cotizacion = cotizacionResult.rows[0];
 
@@ -141,6 +168,13 @@ router.post('/:id/aceptar', async (req, res) => {
     await client.query('COMMIT');
 
     res.json({ mensaje: 'Cotización aceptada, proyecto y contrato generados exitosamente', contrato: contratoResult.rows[0], proyecto_id: proyectoId });
+
+    // Generar y subir el PDF del contrato DESPUÉS de responder, para no hacer esperar al
+    // usuario ni bloquear la aceptación si Puppeteer falla o tarda. Es "best effort": si
+    // falla, el contrato queda igual creado, solo sin pdf_url (se puede reintentar luego).
+    generarYGuardarPdfContrato(id, contratoResult.rows[0].id, proyectoId).catch((error) => {
+      console.error('Error generando PDF automático del contrato:', error.message);
+    });
   } catch (error) {
     await client.query('ROLLBACK');
     console.error('Error aceptando cotización:', error);
@@ -155,7 +189,10 @@ router.put('/:id', async (req, res) => {
   const client = await pool.connect();
   try {
     const { id } = req.params;
-    const { numero, items, descuento } = req.body;
+    const {
+      numero, items, descuento,
+      propietario, ciudad, parrafo_contexto, condiciones_pago, tiempo_entrega, firmante,
+    } = req.body;
 
     const cotizacionResult = await client.query('SELECT * FROM cotizaciones WHERE id = $1', [id]);
     if (cotizacionResult.rows.length === 0) {
@@ -170,14 +207,38 @@ router.put('/:id', async (req, res) => {
     if (items && items.length > 0) {
       const subtotal = items.reduce((sum, item) => sum + parseFloat(item.valor), 0);
       const total = subtotal - (parseFloat(descuento) || 0);
-      await client.query('UPDATE cotizaciones SET numero = $1, total = $2, descuento = $3, updated_at = CURRENT_TIMESTAMP WHERE id = $4', [numero || null, total, parseFloat(descuento) || 0, id]);
+      await client.query(
+        `UPDATE cotizaciones SET numero = $1, total = $2, descuento = $3,
+          propietario = $4, ciudad = $5, parrafo_contexto = $6, condiciones_pago = $7, tiempo_entrega = $8, firmante = $9,
+          updated_at = CURRENT_TIMESTAMP
+         WHERE id = $10`,
+        [
+          numero || null, total, parseFloat(descuento) || 0,
+          propietario || null, ciudad || null, parrafo_contexto || PARRAFO_CONTEXTO_DEFECTO,
+          JSON.stringify(condiciones_pago && condiciones_pago.length ? condiciones_pago : CONDICIONES_PAGO_DEFECTO),
+          tiempo_entrega || TIEMPO_ENTREGA_DEFECTO, firmante || null,
+          id,
+        ]
+      );
 
       await client.query('DELETE FROM cotizacion_items WHERE cotizacion_id = $1', [id]);
       for (const item of items) {
         await client.query('INSERT INTO cotizacion_items (cotizacion_id, descripcion, cantidad, valor, seccion) VALUES ($1, $2, $3, $4, $5)', [id, item.descripcion, item.cantidad || null, item.valor, item.seccion || null]);
       }
     } else {
-      await client.query('UPDATE cotizaciones SET numero = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2', [numero || null, id]);
+      await client.query(
+        `UPDATE cotizaciones SET numero = $1,
+          propietario = $2, ciudad = $3, parrafo_contexto = $4, condiciones_pago = $5, tiempo_entrega = $6, firmante = $7,
+          updated_at = CURRENT_TIMESTAMP
+         WHERE id = $8`,
+        [
+          numero || null,
+          propietario || null, ciudad || null, parrafo_contexto || PARRAFO_CONTEXTO_DEFECTO,
+          JSON.stringify(condiciones_pago && condiciones_pago.length ? condiciones_pago : CONDICIONES_PAGO_DEFECTO),
+          tiempo_entrega || TIEMPO_ENTREGA_DEFECTO, firmante || null,
+          id,
+        ]
+      );
     }
 
     await client.query('COMMIT');
@@ -350,6 +411,45 @@ router.put('/:id/items-aceptada', async (req, res) => {
   }
 });
 
+// 🗑️ ELIMINAR contrato (y la cotización que lo originó): solo GERENCIA puede hacerlo, ya que
+// borra información comercial definitiva. Libera de Firebase Storage el PDF guardado (si existe).
+// IMPORTANTE: esta ruta debe declararse ANTES que DELETE /:id, si no Express interpretaría
+// "contratos" como si fuera el :id de una cotización.
+router.delete('/contratos/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { solicitante_id } = req.body;
+
+    const contratoResult = await pool.query('SELECT * FROM contratos WHERE id = $1', [id]);
+    if (contratoResult.rows.length === 0) {
+      return res.status(404).json({ error: 'Contrato no encontrado' });
+    }
+    const contrato = contratoResult.rows[0];
+
+    if (solicitante_id) {
+      const esGerenciaDeEstaEmpresa = await esGerencia(solicitante_id, contrato.empresa_id);
+      if (!esGerenciaDeEstaEmpresa) {
+        return res.status(403).json({ error: 'Solo Gerencia puede eliminar contratos' });
+      }
+    }
+
+    await pool.query('DELETE FROM contratos WHERE id = $1', [id]);
+    if (contrato.cotizacion_id) {
+      await pool.query('DELETE FROM cotizacion_items WHERE cotizacion_id = $1', [contrato.cotizacion_id]);
+      await pool.query('DELETE FROM cotizaciones WHERE id = $1', [contrato.cotizacion_id]);
+    }
+
+    if (contrato.pdf_url) {
+      await borrarArchivoDeStorage(contrato.pdf_url);
+    }
+
+    res.json({ mensaje: 'Contrato y cotización asociada eliminados exitosamente' });
+  } catch (error) {
+    console.error('Error eliminando contrato:', error);
+    res.status(500).json({ error: 'Error al eliminar el contrato' });
+  }
+});
+
 // 🗑️ ELIMINAR cotización (solo si no ha sido aceptada)
 router.delete('/:id', async (req, res) => {
   try {
@@ -360,7 +460,7 @@ router.delete('/:id', async (req, res) => {
       return res.status(404).json({ error: 'Cotización no encontrada' });
     }
     if (cotizacionResult.rows[0].aceptada) {
-      return res.status(400).json({ error: 'No se puede eliminar una cotización ya aceptada (ya generó un contrato)' });
+      return res.status(400).json({ error: 'No se puede eliminar una cotización ya aceptada (ya generó un contrato). Elimina primero el contrato desde Gerencia.' });
     }
 
     await pool.query('DELETE FROM cotizacion_items WHERE cotizacion_id = $1', [id]);
@@ -372,6 +472,7 @@ router.delete('/:id', async (req, res) => {
     res.status(500).json({ error: 'Error al eliminar cotización' });
   }
 });
+
 // 👁️ LISTAR contratos de una empresa
 router.get('/contratos/listar/:empresa_id', async (req, res) => {
   try {
@@ -390,5 +491,54 @@ router.get('/contratos/listar/:empresa_id', async (req, res) => {
     res.status(500).json({ error: 'Error al listar contratos' });
   }
 });
+
+// 👁️ Contrato de un proyecto específico (usado por la pestaña "Contrato" que ve AREA DE CLIENTES).
+router.get('/contratos/por-proyecto/:proyecto_id', async (req, res) => {
+  try {
+    const { proyecto_id } = req.params;
+    const result = await pool.query('SELECT * FROM contratos WHERE proyecto_id = $1 ORDER BY created_at DESC LIMIT 1', [proyecto_id]);
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Este proyecto todavía no tiene un contrato asociado' });
+    }
+    res.json({ contrato: result.rows[0] });
+  } catch (error) {
+    console.error('Error obteniendo contrato del proyecto:', error);
+    res.status(500).json({ error: 'Error al obtener el contrato' });
+  }
+});
+
+// Genera el PDF del contrato recién creado (a partir de los datos ya guardados de la
+// cotización aceptada) y lo sube a Firebase Storage, guardando la URL en contratos.pdf_url.
+// Se llama de forma asíncrona después de responder al usuario (ver POST /:id/aceptar).
+async function generarYGuardarPdfContrato(cotizacionId, contratoId, proyectoId) {
+  const cotizacion = (await pool.query('SELECT * FROM cotizaciones WHERE id = $1', [cotizacionId])).rows[0];
+  const items = (await pool.query('SELECT * FROM cotizacion_items WHERE cotizacion_id = $1', [cotizacionId])).rows;
+  const cliente = (await pool.query('SELECT * FROM clientes WHERE id = $1', [cotizacion.cliente_id])).rows[0];
+  const empresa = (await pool.query('SELECT * FROM empresas WHERE id = $1', [cotizacion.empresa_id])).rows[0];
+  const contrato = (await pool.query('SELECT * FROM contratos WHERE id = $1', [contratoId])).rows[0];
+
+  const buffer = await generarPdfBuffer({
+    tipoDocumento: 'contrato',
+    empresa: { nombre: empresa.nombre, logo_url: empresa.logo_url, color_hex: empresa.color_hex, sitio_web: empresa.sitio_web },
+    cliente,
+    numero: cotizacion.numero,
+    fecha: contrato.created_at,
+    items,
+    total: cotizacion.total,
+    fechaEntrega: contrato.fecha_entrega,
+    ciudad: cotizacion.ciudad,
+    propietario: cotizacion.propietario,
+    parrafo: cotizacion.parrafo_contexto,
+    descuento: cotizacion.descuento,
+    condicionesPago: cotizacion.condiciones_pago,
+    tiempoEntrega: cotizacion.tiempo_entrega,
+    firmante: cotizacion.firmante,
+  });
+
+  const rutaDestino = `contratos/contrato_${contratoId}_${Date.now()}.pdf`;
+  const url = await subirBufferAStorage(buffer, rutaDestino, 'application/pdf');
+
+  await pool.query('UPDATE contratos SET pdf_url = $1 WHERE id = $2', [url, contratoId]);
+}
 
 module.exports = router;

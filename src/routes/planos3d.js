@@ -2,6 +2,7 @@ const express = require('express');
 const { Pool } = require('pg');
 const router = express.Router();
 require('dotenv').config();
+const { borrarArchivoDeStorage } = require('../utils/firebaseAdmin');
 
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
@@ -70,7 +71,8 @@ router.get('/:proyecto_id/:area_id', async (req, res) => {
   }
 });
 
-// 🗑️ ELIMINAR un plano 3D (solo la referencia en la base de datos). Solo roles administrativos.
+// 🗑️ ELIMINAR un plano 3D: borra la fila y también el archivo .glb real en Firebase Storage.
+// Solo roles administrativos.
 router.delete('/:id', async (req, res) => {
   try {
     const { id } = req.params;
@@ -88,6 +90,7 @@ router.delete('/:id', async (req, res) => {
     }
 
     await pool.query('DELETE FROM planos_3d WHERE id = $1', [id]);
+    await borrarArchivoDeStorage(plano.url_glb);
 
     res.json({ mensaje: 'Plano 3D eliminado exitosamente' });
   } catch (error) {
