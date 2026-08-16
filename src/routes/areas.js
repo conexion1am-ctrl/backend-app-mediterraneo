@@ -26,6 +26,7 @@ router.get('/personal/:empresa_id', async (req, res) => {
 
     const vinculados = await pool.query(
       `SELECT uer.id AS rol_id, u.id AS usuario_id, u.nombre, u.celular, u.foto_url,
+              u.arl_documento_url, u.arl_vencimiento,
               a.id AS area_id, a.nombre AS area_nombre, a.tipo AS area_tipo,
               'vinculado' AS estado
        FROM usuario_empresa_rol uer
@@ -37,6 +38,7 @@ router.get('/personal/:empresa_id', async (req, res) => {
 
     const pendientes = await pool.query(
       `SELECT i.id AS rol_id, NULL AS usuario_id, i.nombre_invitado AS nombre, i.celular_invitado AS celular, NULL AS foto_url,
+              NULL AS arl_documento_url, NULL AS arl_vencimiento,
               a.id AS area_id, a.nombre AS area_nombre, a.tipo AS area_tipo,
               'pendiente' AS estado
        FROM invitaciones i
@@ -189,6 +191,58 @@ router.delete('/personal/vinculado/:rol_id', async (req, res) => {
   } catch (error) {
     console.error('Error desactivando persona/área:', error);
     res.status(500).json({ error: 'Error al desactivar' });
+  }
+});
+
+// 📄 SUBIR/ACTUALIZAR documento ARL (riesgos profesionales) de una persona vinculada.
+// El archivo ya fue subido a Firebase Storage desde el frontend; aquí solo se guarda la
+// referencia (url) y la fecha de vencimiento para poder avisar si ya expiró.
+router.put('/personal/vinculado/:usuario_id/arl', async (req, res) => {
+  try {
+    const { usuario_id } = req.params;
+    const { arl_documento_url, arl_vencimiento } = req.body;
+
+    if (!arl_documento_url) {
+      return res.status(400).json({ error: 'arl_documento_url es obligatorio' });
+    }
+
+    const result = await pool.query(
+      'UPDATE usuarios SET arl_documento_url = $1, arl_vencimiento = $2 WHERE id = $3 RETURNING *',
+      [arl_documento_url, arl_vencimiento || null, usuario_id]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Persona no encontrada' });
+    }
+
+    const usuario = result.rows[0];
+    delete usuario.contraseña_hash;
+
+    res.json({ mensaje: 'Documento ARL actualizado exitosamente', usuario });
+  } catch (error) {
+    console.error('Error actualizando documento ARL:', error);
+    res.status(500).json({ error: 'Error al actualizar el documento ARL' });
+  }
+});
+
+// 🗑️ ELIMINAR documento ARL de una persona (por si se subió por error o hay que reemplazarlo)
+router.delete('/personal/vinculado/:usuario_id/arl', async (req, res) => {
+  try {
+    const { usuario_id } = req.params;
+
+    const result = await pool.query(
+      'UPDATE usuarios SET arl_documento_url = NULL, arl_vencimiento = NULL WHERE id = $1 RETURNING *',
+      [usuario_id]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Persona no encontrada' });
+    }
+
+    res.json({ mensaje: 'Documento ARL eliminado exitosamente' });
+  } catch (error) {
+    console.error('Error eliminando documento ARL:', error);
+    res.status(500).json({ error: 'Error al eliminar el documento ARL' });
   }
 });
 
