@@ -5,6 +5,7 @@ require('dotenv').config();
 const { generarPdfBuffer } = require('../utils/generarPdf');
 const { subirBufferAStorage, borrarArchivoDeStorage } = require('../utils/firebaseAdmin');
 const { esGerencia } = require('../utils/permisos');
+const { borrarDependenciasDeProyecto } = require('../utils/cascadaProyecto');
 
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
@@ -78,11 +79,13 @@ router.post('/crear', async (req, res) => {
 router.get('/listar/:empresa_id', async (req, res) => {
   try {
     const { empresa_id } = req.params;
+    // LEFT JOIN (no JOIN): si el cliente fue eliminado, la cotización sigue apareciendo,
+    // usando el nombre que quedó guardado en cliente_nombre_snapshot al momento de eliminarlo.
     const result = await pool.query(
-      `SELECT co.*, cl.nombre AS cliente_nombre 
-       FROM cotizaciones co 
-       JOIN clientes cl ON cl.id = co.cliente_id 
-       WHERE co.empresa_id = $1 
+      `SELECT co.*, COALESCE(cl.nombre, co.cliente_nombre_snapshot) AS cliente_nombre
+       FROM cotizaciones co
+       LEFT JOIN clientes cl ON cl.id = co.cliente_id
+       WHERE co.empresa_id = $1
        ORDER BY co.created_at DESC`,
       [empresa_id]
     );
@@ -413,16 +416,20 @@ router.put('/:id/items-aceptada', async (req, res) => {
   }
 });
 
-// 🗑️ ELIMINAR contrato (y la cotización que lo originó): solo GERENCIA puede hacerlo, ya que
-// borra información comercial definitiva. Libera de Firebase Storage el PDF guardado (si existe).
+// 🗑️ ELIMINAR contrato, la cotización que lo originó, y TODO el proyecto asociado (fotos,
+// planos 3D, mensajes/chat y sus adjuntos, equipo asignado, estadísticas), igual que al
+// eliminar un cliente. Solo GERENCIA puede hacerlo, ya que borra información comercial y de
+// obra definitiva. Libera de Firebase Storage el PDF del contrato y todos los archivos del
+// proyecto (fotos, planos .glb, adjuntos de chat).
 // IMPORTANTE: esta ruta debe declararse ANTES que DELETE /:id, si no Express interpretaría
 // "contratos" como si fuera el :id de una cotización.
 router.delete('/contratos/:id', async (req, res) => {
+  const client = await pool.connect();
   try {
     const { id } = req.params;
     const { solicitante_id } = req.body;
 
-    const contratoResult = await pool.query('SELECT * FROM contratos WHERE id = $1', [id]);
+    const contratoResult = await client.query('SELECT * FROM contratos WHERE id = $1', [id]);
     if (contratoResult.rows.length === 0) {
       return res.status(404).json({ error: 'Contrato no encontrado' });
     }
@@ -435,34 +442,83 @@ router.delete('/contratos/:id', async (req, res) => {
       }
     }
 
-    await pool.query('DELETE FROM contratos WHERE id = $1', [id]);
+    const urlsABorrar = [];
+    if (contrato.pdf_url) urlsABorrar.push(contrato.pdf_url);
+
+    await client.query('BEGIN');
+
+    // IMPORTANTE: el orden de borrado importa por las llaves foráneas. Seguimos el mismo
+    // patrón ya probado en clientes.js: primero se limpia todo lo que "cuelga" del proyecto
+    // (fotos, planos, chat, equipo, estadísticas), luego el proyecto, y el contrato se borra
+    // AL FINAL de todo (antes se borraba primero, lo que podía chocar con alguna referencia
+    // pendiente hacia el contrato y producir "No se pudo eliminar el contrato").
+    const proyectoId = contrato.proyecto_id;
+    if (proyectoId) {
+      const urlsDelProyecto = await borrarDependenciasDeProyecto(client, proyectoId);
+      urlsABorrar.push(...urlsDelProyecto);
+    }
+
+    // El contrato tiene su propia fila en cotizacion_items/cotizaciones vinculada por
+    // cotizacion_id: borramos la cotización (y sus ítems) ANTES que el contrato, porque
+    // contratos.cotizacion_id apunta hacia cotizaciones.id (el contrato es el que depende
+    // de la cotización, no al revés).
     if (contrato.cotizacion_id) {
-      await pool.query('DELETE FROM cotizacion_items WHERE cotizacion_id = $1', [contrato.cotizacion_id]);
-      await pool.query('DELETE FROM cotizaciones WHERE id = $1', [contrato.cotizacion_id]);
+      await client.query('DELETE FROM cotizacion_items WHERE cotizacion_id = $1', [contrato.cotizacion_id]);
+      await client.query('DELETE FROM cotizaciones WHERE id = $1', [contrato.cotizacion_id]);
     }
 
-    if (contrato.pdf_url) {
-      await borrarArchivoDeStorage(contrato.pdf_url);
+    // El proyecto se borra después de vaciar todo lo que dependía de él.
+    if (proyectoId) {
+      await client.query('DELETE FROM proyectos WHERE id = $1', [proyectoId]);
     }
 
-    res.json({ mensaje: 'Contrato y cotización asociada eliminados exitosamente' });
+    // El contrato se borra al final: ya no queda ninguna fila en otras tablas que lo referencie.
+    await client.query('DELETE FROM contratos WHERE id = $1', [id]);
+
+    await client.query('COMMIT');
+
+    for (const url of urlsABorrar) {
+      await borrarArchivoDeStorage(url).catch((error) => {
+        console.error('Error borrando archivo de Storage al eliminar contrato:', error.message);
+      });
+    }
+
+    res.json({ mensaje: 'Contrato, cotización y proyecto asociado eliminados exitosamente' });
   } catch (error) {
-    console.error('Error eliminando contrato:', error);
+    await client.query('ROLLBACK');
+    // Loggeamos el detalle real de Postgres (código y tabla/constraint si viene), no solo el
+    // mensaje genérico, para poder diagnosticar rápido desde los logs de Render si vuelve a fallar.
+    console.error('Error eliminando contrato:', error.message, '| code:', error.code, '| detail:', error.detail, '| constraint:', error.constraint, '| table:', error.table);
     res.status(500).json({ error: 'Error al eliminar el contrato' });
+  } finally {
+    client.release();
   }
 });
 
-// 🗑️ ELIMINAR cotización (solo si no ha sido aceptada)
+// 🗑️ ELIMINAR cotización. Solo Gerencia puede eliminarlas (mismo permiso que para contratos).
+// Si ya fue aceptada (tiene un contrato generado), primero hay que eliminar el contrato desde
+// la pantalla de Contratos (esto también elimina la cotización que lo originó, ver DELETE
+// /contratos/:id), para no dejar un contrato huérfano apuntando a una cotización inexistente.
 router.delete('/:id', async (req, res) => {
   try {
     const { id } = req.params;
+    const { solicitante_id } = req.body;
 
     const cotizacionResult = await pool.query('SELECT * FROM cotizaciones WHERE id = $1', [id]);
     if (cotizacionResult.rows.length === 0) {
       return res.status(404).json({ error: 'Cotización no encontrada' });
     }
-    if (cotizacionResult.rows[0].aceptada) {
-      return res.status(400).json({ error: 'No se puede eliminar una cotización ya aceptada (ya generó un contrato). Elimina primero el contrato desde Gerencia.' });
+    const cotizacion = cotizacionResult.rows[0];
+
+    if (solicitante_id) {
+      const esGerenciaDeEstaEmpresa = await esGerencia(solicitante_id, cotizacion.empresa_id);
+      if (!esGerenciaDeEstaEmpresa) {
+        return res.status(403).json({ error: 'Solo Gerencia puede eliminar cotizaciones' });
+      }
+    }
+
+    if (cotizacion.aceptada) {
+      return res.status(400).json({ error: 'No se puede eliminar una cotización ya aceptada (ya generó un contrato). Elimina primero el contrato desde la pantalla de Contratos.' });
     }
 
     await pool.query('DELETE FROM cotizacion_items WHERE cotizacion_id = $1', [id]);
@@ -527,7 +583,10 @@ router.post('/contratos/:id/regenerar-pdf', async (req, res) => {
     const actualizado = (await pool.query('SELECT * FROM contratos WHERE id = $1', [id])).rows[0];
     res.json({ mensaje: 'PDF regenerado exitosamente', contrato: actualizado });
   } catch (error) {
-    console.error('Error regenerando PDF del contrato:', error);
+    // Loggeamos el mensaje completo (no solo el objeto error) para poder ver en los logs de
+    // Render la causa real: por ejemplo "Firebase Admin no está configurado en el servidor"
+    // (falta la variable de entorno FIREBASE_SERVICE_ACCOUNT_JSON) o un fallo de Puppeteer/Chromium.
+    console.error('Error regenerando PDF del contrato:', error.message, error.stack);
     res.status(500).json({ error: 'No se pudo generar el PDF. Intenta de nuevo en unos minutos.' });
   }
 });

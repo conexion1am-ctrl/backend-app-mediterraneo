@@ -1,4 +1,10 @@
-const admin = require('firebase-admin');
+// firebase-admin@14 cambió su forma de importarse: ya no existe el objeto clásico
+// `admin.apps` / `admin.storage()` en la raíz del paquete. Ahora cada pieza se importa por
+// separado desde subrutas ("API modular"). Usar la forma vieja hacía que el servidor se
+// cayera al arrancar (admin.apps era undefined), dejando el deploy en Render "fallido" y
+// el servidor corriendo código viejo indefinidamente.
+const { initializeApp, cert, getApps } = require('firebase-admin/app');
+const { getStorage } = require('firebase-admin/storage');
 const path = require('path');
 const fs = require('fs');
 
@@ -18,18 +24,27 @@ function cargarCredenciales() {
 }
 
 let bucket = null;
-const credenciales = cargarCredenciales();
 
-if (credenciales) {
-  if (admin.apps.length === 0) {
-    admin.initializeApp({
-      credential: admin.credential.cert(credenciales),
-      storageBucket: 'cyd-manager.firebasestorage.app',
-    });
+// Todo este bloque está envuelto en try/catch: si algo falla al inicializar Firebase (JSON mal
+// formado, versión de firebase-admin incompatible, etc.), el servidor completo NO debe caerse
+// por esto — el resto de la app (base de datos, login, chat, etc.) debe seguir funcionando
+// igual, solo sin la capacidad de subir/borrar archivos de Storage desde el servidor.
+try {
+  const credenciales = cargarCredenciales();
+
+  if (credenciales) {
+    if (getApps().length === 0) {
+      initializeApp({
+        credential: cert(credenciales),
+        storageBucket: 'cyd-manager.firebasestorage.app',
+      });
+    }
+    bucket = getStorage().bucket();
+  } else {
+    console.warn('⚠️ Firebase Admin no configurado: falta firebase-service-account.json o FIREBASE_SERVICE_ACCOUNT_JSON. No se podrán borrar ni subir archivos de Storage desde el servidor.');
   }
-  bucket = admin.storage().bucket();
-} else {
-  console.warn('⚠️ Firebase Admin no configurado: falta firebase-service-account.json o FIREBASE_SERVICE_ACCOUNT_JSON. No se podrán borrar ni subir archivos de Storage desde el servidor.');
+} catch (error) {
+  console.error('⚠️ Error inicializando Firebase Admin (el servidor sigue funcionando, pero sin Storage):', error.message);
 }
 
 // Extrae el "path" interno del archivo dentro del bucket a partir de una URL de descarga de
