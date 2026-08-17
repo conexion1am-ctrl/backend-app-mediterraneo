@@ -140,9 +140,11 @@ router.post('/:id/aceptar', async (req, res) => {
       const cliente = clienteResult.rows[0];
       const nombreProyecto = (cliente && cliente.nombre_proyecto) ? cliente.nombre_proyecto : `Proyecto de ${cliente ? cliente.nombre : 'cliente'}`;
 
+      // Arrastramos mts2 y dirección desde la ficha del cliente al crear el proyecto,
+      // para no tener que volver a escribirlos.
       const nuevoProyecto = await client.query(
-        'INSERT INTO proyectos (empresa_id, nombre) VALUES ($1, $2) RETURNING *',
-        [cotizacion.empresa_id, nombreProyecto]
+        'INSERT INTO proyectos (empresa_id, nombre, direccion, area_m2) VALUES ($1, $2, $3, $4) RETURNING *',
+        [cotizacion.empresa_id, nombreProyecto, cliente?.direccion || null, cliente?.mts2 || null]
       );
       proyectoId = nuevoProyecto.rows[0].id;
 
@@ -507,6 +509,29 @@ router.get('/contratos/por-proyecto/:proyecto_id', async (req, res) => {
   }
 });
 
+// 🔁 Regenerar el PDF de un contrato ya existente (por si falló la primera vez, o si se
+// editaron datos de la empresa/cliente después de aceptar la cotización). No pide nada al
+// usuario: usa siempre los datos ya guardados en la base de datos, igual que la generación
+// automática al aceptar.
+router.post('/contratos/:id/regenerar-pdf', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const contrato = (await pool.query('SELECT * FROM contratos WHERE id = $1', [id])).rows[0];
+    if (!contrato) {
+      return res.status(404).json({ error: 'Contrato no encontrado' });
+    }
+    if (!contrato.cotizacion_id) {
+      return res.status(400).json({ error: 'Este contrato no tiene una cotización asociada' });
+    }
+    await generarYGuardarPdfContrato(contrato.cotizacion_id, contrato.id, contrato.proyecto_id);
+    const actualizado = (await pool.query('SELECT * FROM contratos WHERE id = $1', [id])).rows[0];
+    res.json({ mensaje: 'PDF regenerado exitosamente', contrato: actualizado });
+  } catch (error) {
+    console.error('Error regenerando PDF del contrato:', error);
+    res.status(500).json({ error: 'No se pudo generar el PDF. Intenta de nuevo en unos minutos.' });
+  }
+});
+
 // Genera el PDF del contrato recién creado (a partir de los datos ya guardados de la
 // cotización aceptada) y lo sube a Firebase Storage, guardando la URL en contratos.pdf_url.
 // Se llama de forma asíncrona después de responder al usuario (ver POST /:id/aceptar).
@@ -519,7 +544,7 @@ async function generarYGuardarPdfContrato(cotizacionId, contratoId, proyectoId) 
 
   const buffer = await generarPdfBuffer({
     tipoDocumento: 'contrato',
-    empresa: { nombre: empresa.nombre, logo_url: empresa.logo_url, color_hex: empresa.color_hex, sitio_web: empresa.sitio_web },
+    empresa,
     cliente,
     numero: cotizacion.numero,
     fecha: contrato.created_at,

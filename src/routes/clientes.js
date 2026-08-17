@@ -13,15 +13,15 @@ const pool = new Pool({
 // 📝 CREAR cliente
 router.post('/crear', async (req, res) => {
   try {
-    const { empresa_id, proyecto_id, nombre, celular, contrato_url, nombre_proyecto } = req.body;
+    const { empresa_id, proyecto_id, nombre, celular, contrato_url, nombre_proyecto, mts2, direccion, cedula } = req.body;
 
     if (!empresa_id || !nombre) {
       return res.status(400).json({ error: 'empresa_id y nombre son obligatorios' });
     }
 
     const result = await pool.query(
-      'INSERT INTO clientes (empresa_id, proyecto_id, nombre, celular, contrato_url, nombre_proyecto) VALUES ($1, $2, $3, $4, $5, $6) RETURNING *',
-      [empresa_id, proyecto_id || null, nombre, celular || null, contrato_url || null, nombre_proyecto || null]
+      'INSERT INTO clientes (empresa_id, proyecto_id, nombre, celular, contrato_url, nombre_proyecto, mts2, direccion, cedula) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING *',
+      [empresa_id, proyecto_id || null, nombre, celular || null, contrato_url || null, nombre_proyecto || null, mts2 || null, direccion || null, cedula || null]
     );
 
     res.status(201).json({ mensaje: 'Cliente creado exitosamente', cliente: result.rows[0] });
@@ -35,15 +35,15 @@ router.post('/crear', async (req, res) => {
 router.put('/:id', async (req, res) => {
   try {
     const { id } = req.params;
-    const { nombre, celular, nombre_proyecto } = req.body;
+    const { nombre, celular, nombre_proyecto, mts2, direccion, cedula } = req.body;
 
     if (!nombre || !nombre.trim()) {
       return res.status(400).json({ error: 'El nombre es obligatorio' });
     }
 
     const result = await pool.query(
-      'UPDATE clientes SET nombre = $1, celular = $2, nombre_proyecto = $3 WHERE id = $4 RETURNING *',
-      [nombre, celular || null, nombre_proyecto || null, id]
+      'UPDATE clientes SET nombre = $1, celular = $2, nombre_proyecto = $3, mts2 = $4, direccion = $5, cedula = $6 WHERE id = $7 RETURNING *',
+      [nombre, celular || null, nombre_proyecto || null, mts2 || null, direccion || null, cedula || null, id]
     );
 
     if (result.rows.length === 0) {

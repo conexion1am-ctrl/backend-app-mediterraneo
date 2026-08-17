@@ -92,7 +92,10 @@ router.post('/crear-perfil', async (req, res) => {
 router.put('/:id', async (req, res) => {
   try {
     const { id } = req.params;
-    const { nombre_empresa, logo_url, sitio_web, color_hex, solicitante_id } = req.body;
+    const {
+      nombre_empresa, logo_url, sitio_web, color_hex, solicitante_id,
+      cedula_representante, nit, banco_nombre, banco_tipo_cuenta, banco_numero, banco_titular,
+    } = req.body;
 
     if (!nombre_empresa) {
       return res.status(400).json({ error: 'El nombre de la empresa es obligatorio' });
@@ -107,10 +110,17 @@ router.put('/:id', async (req, res) => {
 
     const resultado = await pool.query(
       `UPDATE empresas
-       SET nombre = $1, logo_url = $2, sitio_web = $3, color_hex = $4
-       WHERE id = $5
+       SET nombre = $1, logo_url = $2, sitio_web = $3, color_hex = $4,
+           cedula_representante = $5, nit = $6, banco_nombre = $7,
+           banco_tipo_cuenta = $8, banco_numero = $9, banco_titular = $10
+       WHERE id = $11
        RETURNING *`,
-      [nombre_empresa, logo_url || null, sitio_web || null, color_hex || null, id]
+      [
+        nombre_empresa, logo_url || null, sitio_web || null, color_hex || null,
+        cedula_representante || null, nit || null, banco_nombre || null,
+        banco_tipo_cuenta || null, banco_numero || null, banco_titular || null,
+        id,
+      ]
     );
 
     if (resultado.rows.length === 0) {

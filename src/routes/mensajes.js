@@ -37,16 +37,25 @@ async function enviarPush(pushToken, titulo, cuerpo, data) {
 // 📝 ENVIAR mensaje en el chat individual de una persona, dentro de un área y un proyecto
 router.post('/enviar', async (req, res) => {
   try {
-    const { proyecto_id, area_id, usuario_id, destinatario_usuario_id, contenido } = req.body;
+    const { proyecto_id, area_id, usuario_id, destinatario_usuario_id, contenido, archivo } = req.body;
 
-    if (!proyecto_id || !area_id || !usuario_id || !destinatario_usuario_id || !contenido) {
-      return res.status(400).json({ error: 'proyecto_id, area_id, usuario_id, destinatario_usuario_id y contenido son obligatorios' });
+    // El mensaje puede ir solo con archivo adjunto (sin texto), como en WhatsApp.
+    if (!proyecto_id || !area_id || !usuario_id || !destinatario_usuario_id || (!contenido && !archivo)) {
+      return res.status(400).json({ error: 'proyecto_id, area_id, usuario_id, destinatario_usuario_id y (contenido o archivo) son obligatorios' });
     }
 
     const result = await pool.query(
       'INSERT INTO mensajes (proyecto_id, area_id, usuario_id, destinatario_usuario_id, contenido) VALUES ($1, $2, $3, $4, $5) RETURNING *',
-      [proyecto_id, area_id, usuario_id, destinatario_usuario_id, contenido]
+      [proyecto_id, area_id, usuario_id, destinatario_usuario_id, contenido || '']
     );
+
+    // Si el mensaje viene con un archivo (foto/documento), lo guardamos vinculado a este mensaje.
+    if (archivo?.url_archivo) {
+      await pool.query(
+        'INSERT INTO archivos (mensaje_id, usuario_id, nombre_archivo, url_archivo, tipo_archivo) VALUES ($1, $2, $3, $4, $5)',
+        [result.rows[0].id, usuario_id, archivo.nombre_archivo || null, archivo.url_archivo, archivo.tipo_archivo || null]
+      );
+    }
 
     // Avisamos al destinatario con una notificación push, si tiene un dispositivo registrado.
     const [remitente, destinatario, proyecto, areaCatalogo] = await Promise.all([
@@ -62,7 +71,7 @@ router.post('/enviar', async (req, res) => {
       enviarPush(
         pushToken,
         nombreRemitente,
-        contenido,
+        contenido || '📎 Envió un archivo',
         {
           tipo: 'mensaje',
           proyecto_id,
@@ -96,7 +105,27 @@ router.get('/:proyecto_id/:area_id/:destinatario_usuario_id', async (req, res) =
       [proyecto_id, area_id, destinatario_usuario_id]
     );
 
-    res.json({ total: result.rows.length, mensajes: result.rows });
+    // Traemos los archivos adjuntos de todos estos mensajes en una sola consulta y los
+    // agrupamos por mensaje_id, para no hacer una consulta extra por cada mensaje.
+    const idsMensajes = result.rows.map((m) => m.id);
+    let archivosPorMensaje = {};
+    if (idsMensajes.length > 0) {
+      const archivosResult = await pool.query(
+        'SELECT * FROM archivos WHERE mensaje_id = ANY($1::int[]) ORDER BY created_at ASC',
+        [idsMensajes]
+      );
+      archivosPorMensaje = archivosResult.rows.reduce((acc, archivo) => {
+        (acc[archivo.mensaje_id] = acc[archivo.mensaje_id] || []).push(archivo);
+        return acc;
+      }, {});
+    }
+
+    const mensajesConArchivos = result.rows.map((m) => ({
+      ...m,
+      archivos: archivosPorMensaje[m.id] || [],
+    }));
+
+    res.json({ total: mensajesConArchivos.length, mensajes: mensajesConArchivos });
   } catch (error) {
     console.error('Error obteniendo mensajes:', error);
     res.status(500).json({ error: 'Error al obtener mensajes' });
