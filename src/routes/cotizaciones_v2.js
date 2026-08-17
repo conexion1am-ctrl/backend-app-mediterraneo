@@ -81,8 +81,11 @@ router.get('/listar/:empresa_id', async (req, res) => {
     const { empresa_id } = req.params;
     // LEFT JOIN (no JOIN): si el cliente fue eliminado, la cotización sigue apareciendo,
     // usando el nombre que quedó guardado en cliente_nombre_snapshot al momento de eliminarlo.
+    // También traemos nombre_proyecto y mts2 del cliente, para mostrarlos en la ficha de la
+    // pantalla de Cotizaciones (si el cliente ya fue eliminado, estos quedan en null).
     const result = await pool.query(
-      `SELECT co.*, COALESCE(cl.nombre, co.cliente_nombre_snapshot) AS cliente_nombre
+      `SELECT co.*, COALESCE(cl.nombre, co.cliente_nombre_snapshot) AS cliente_nombre,
+              cl.nombre_proyecto, cl.mts2
        FROM cotizaciones co
        LEFT JOIN clientes cl ON cl.id = co.cliente_id
        WHERE co.empresa_id = $1

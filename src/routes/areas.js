@@ -49,10 +49,10 @@ router.get('/personal/:empresa_id', async (req, res) => {
       [empresa_id]
     );
 
-    const personal = [...vinculados.rows, ...pendientes.rows].sort((a, b) => {
-      if (a.area_nombre !== b.area_nombre) return a.area_nombre.localeCompare(b.area_nombre);
-      return a.nombre.localeCompare(b.nombre);
-    });
+    // Orden alfabético por nombre de la persona (antes se agrupaba primero por área).
+    const personal = [...vinculados.rows, ...pendientes.rows].sort((a, b) =>
+      a.nombre.localeCompare(b.nombre)
+    );
 
     res.json({ total: personal.length, personal });
   } catch (error) {
