@@ -322,93 +322,21 @@ router.put('/:id', async (req, res) => {
   }
 });
 
-// ➕ AGREGAR ítems adicionales a una cotización YA ACEPTADA (ej: el cliente pide adicionales en obra)
-// Recalcula el total de la cotización y lo propaga al contrato y a estadisticas_proyecto.valor_contrato
-router.post('/:id/adicionales', async (req, res) => {
-  const client = await pool.connect();
-  try {
-    const { id } = req.params;
-    const { items } = req.body;
-
-    if (!items || items.length === 0) {
-      return res.status(400).json({ error: 'Debes enviar al menos un ítem adicional' });
-    }
-
-    const cotizacionResult = await client.query('SELECT * FROM cotizaciones WHERE id = $1', [id]);
-    if (cotizacionResult.rows.length === 0) {
-      return res.status(404).json({ error: 'Cotización no encontrada' });
-    }
-    const cotizacion = cotizacionResult.rows[0];
-
-    if (!cotizacion.aceptada) {
-      return res.status(400).json({ error: 'Esta cotización todavía no ha sido aceptada. Para editarla usa la opción Editar.' });
-    }
-
-    await client.query('BEGIN');
-
-    const itemsValidos = items.filter((i) => i.descripcion && i.descripcion.trim() && i.valor);
-    if (itemsValidos.length === 0) {
-      await client.query('ROLLBACK');
-      return res.status(400).json({ error: 'Los ítems deben tener descripción y valor' });
-    }
-
-    for (const item of itemsValidos) {
-      await client.query(
-        'INSERT INTO cotizacion_items (cotizacion_id, descripcion, cantidad, valor, adicional, seccion) VALUES ($1, $2, $3, $4, TRUE, $5)',
-        [id, item.descripcion, item.cantidad || null, item.valor, item.seccion || null]
-      );
-    }
-
-    const totalItemsResult = await client.query(
-      'SELECT COALESCE(SUM(valor), 0) AS total FROM cotizacion_items WHERE cotizacion_id = $1',
-      [id]
-    );
-    const nuevoTotal = parseFloat(totalItemsResult.rows[0].total);
-
-    await client.query(
-      'UPDATE cotizaciones SET total = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2',
-      [nuevoTotal, id]
-    );
-
-    let contratoActualizado = null;
-    if (cotizacion.proyecto_id) {
-      const contratoResult = await client.query(
-        'UPDATE contratos SET valor_total = $1 WHERE proyecto_id = $2 RETURNING *',
-        [nuevoTotal, cotizacion.proyecto_id]
-      );
-      contratoActualizado = contratoResult.rows[0] || null;
-
-      await client.query(
-        'UPDATE estadisticas_proyecto SET valor_contrato = $1, updated_at = CURRENT_TIMESTAMP WHERE proyecto_id = $2',
-        [nuevoTotal, cotizacion.proyecto_id]
-      );
-    }
-
-    await client.query('COMMIT');
-
-    res.json({
-      mensaje: 'Ítems adicionales agregados exitosamente',
-      total: nuevoTotal,
-      contrato: contratoActualizado,
-      proyecto_id: cotizacion.proyecto_id
-    });
-  } catch (error) {
-    await client.query('ROLLBACK');
-    console.error('Error agregando adicionales:', error);
-    res.status(500).json({ error: 'Error al agregar ítems adicionales' });
-  } finally {
-    client.release();
-  }
-});
-
-// ✏️ EDITAR ítems de una cotización YA ACEPTADA (el cliente pide cambiar cantidades, valores o
-// quitar/agregar ítems mientras la obra está en curso). Reemplaza la lista completa de ítems,
-// recalcula el total y propaga el nuevo valor al contrato y a las estadísticas del proyecto.
+// ✏️ EDITAR una cotización YA ACEPTADA: ítems, descuento, Y también los datos de la carta
+// (propietario, ciudad, párrafo, condiciones de pago, tiempo de entrega, firmante). Antes esto
+// solo dejaba tocar ítems/descuento; ahora reabre la cotización completa, igual que el editor de
+// una cotización sin aceptar, para no tener que usar un flujo aparte de "agregar adicionales".
+// Reemplaza la lista completa de ítems, recalcula el total, propaga el nuevo valor al contrato
+// y a las estadísticas del proyecto, y regenera el PDF del contrato en segundo plano para que
+// quede sincronizado con los datos nuevos.
 router.put('/:id/items-aceptada', async (req, res) => {
   const client = await pool.connect();
   try {
     const { id } = req.params;
-    const { items, descuento } = req.body;
+    const {
+      items, descuento,
+      propietario, ciudad, parrafo_contexto, condiciones_pago, tiempo_entrega, firmante,
+    } = req.body;
 
     if (!items || items.length === 0) {
       return res.status(400).json({ error: 'Debes enviar al menos un ítem' });
@@ -446,18 +374,35 @@ router.put('/:id/items-aceptada', async (req, res) => {
     const nuevoTotal = subtotal - descuentoAplicado;
 
     await client.query(
-      'UPDATE cotizaciones SET total = $1, descuento = $2, updated_at = CURRENT_TIMESTAMP WHERE id = $3',
-      [nuevoTotal, descuentoAplicado, id]
+      `UPDATE cotizaciones SET
+         total = $1, descuento = $2,
+         propietario = COALESCE($3, propietario),
+         ciudad = COALESCE($4, ciudad),
+         parrafo_contexto = COALESCE($5, parrafo_contexto),
+         condiciones_pago = COALESCE($6, condiciones_pago),
+         tiempo_entrega = COALESCE($7, tiempo_entrega),
+         firmante = COALESCE($8, firmante),
+         updated_at = CURRENT_TIMESTAMP
+       WHERE id = $9`,
+      [
+        nuevoTotal, descuentoAplicado,
+        propietario ?? null, ciudad ?? null, parrafo_contexto ?? null,
+        condiciones_pago ? JSON.stringify(condiciones_pago) : null,
+        tiempo_entrega ?? null, firmante ?? null,
+        id,
+      ]
     );
 
-    let contratoActualizado = null;
-    if (cotizacion.proyecto_id) {
-      const contratoResult = await client.query(
-        'UPDATE contratos SET valor_total = $1 WHERE proyecto_id = $2 RETURNING *',
-        [nuevoTotal, cotizacion.proyecto_id]
-      );
-      contratoActualizado = contratoResult.rows[0] || null;
+    // Buscamos el contrato por cotizacion_id (no por proyecto_id: la cotización puede estar
+    // aceptada sin tener todavía un proyecto creado, ver la reorganización de Clientes/
+    // Cotizaciones/Contratos/Proyectos independientes).
+    const contratoResult = await client.query(
+      'UPDATE contratos SET valor_total = $1 WHERE cotizacion_id = $2 RETURNING *',
+      [nuevoTotal, id]
+    );
+    const contratoActualizado = contratoResult.rows[0] || null;
 
+    if (cotizacion.proyecto_id) {
       await client.query(
         'UPDATE estadisticas_proyecto SET valor_contrato = $1, updated_at = CURRENT_TIMESTAMP WHERE proyecto_id = $2',
         [nuevoTotal, cotizacion.proyecto_id]
@@ -472,9 +417,17 @@ router.put('/:id/items-aceptada', async (req, res) => {
       contrato: contratoActualizado,
       proyecto_id: cotizacion.proyecto_id
     });
+
+    // Regeneramos el PDF del contrato en segundo plano (best effort) para que quede
+    // sincronizado con los nuevos datos de la carta/ítems, sin hacer esperar al usuario.
+    if (contratoActualizado) {
+      generarYGuardarPdfContrato(id, contratoActualizado.id, cotizacion.proyecto_id).catch((error) => {
+        console.error('Error regenerando PDF tras editar cotización aceptada:', error.message);
+      });
+    }
   } catch (error) {
     await client.query('ROLLBACK');
-    console.error('Error editando ítems de cotización aceptada:', error);
+    console.error('Error editando cotización aceptada:', error);
     res.status(500).json({ error: 'Error al editar la cotización' });
   } finally {
     client.release();
