@@ -1,0 +1,62 @@
+const { Pool } = require('pg');
+require('dotenv').config();
+
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: { rejectUnauthorized: false },
+});
+
+// Cambios de esquema que se aplican automáticamente cada vez que el servidor arranca en Render.
+// Usamos "ADD COLUMN IF NOT EXISTS" para que sea seguro correrlo una y otra vez sin duplicar
+// columnas ni romper nada si ya existen. Este es el mismo patrón que se viene usando para agregar
+// columnas nuevas a la base de datos real (nit, cedula_representante, cliente_nombre_snapshot,
+// etc.), pero ahora automatizado en vez de correrlo a mano en la consola de Railway.
+//
+// Estas columnas nuevas son la base del "blindaje" pedido: el proyecto y el contrato deben poder
+// existir de forma independiente, cada uno guardando su propia copia de los datos que necesita
+// para no romperse si se borra la cotización o el cliente que los originó.
+async function aplicarMigraciones() {
+  try {
+    console.log('🔧 Verificando esquema de base de datos (migraciones automáticas)...');
+
+    // contratos: ya no depende de que el proyecto exista en el momento de aceptar la cotización.
+    // Guarda un snapshot mínimo (nombre, dirección, m2) para poder crear o recrear el proyecto
+    // más adelante con el botón "Crear Proyecto", incluso si el cliente original fue borrado.
+    await pool.query(`ALTER TABLE contratos ADD COLUMN IF NOT EXISTS proyecto_nombre_snapshot VARCHAR(255)`);
+    await pool.query(`ALTER TABLE contratos ADD COLUMN IF NOT EXISTS proyecto_direccion_snapshot TEXT`);
+    await pool.query(`ALTER TABLE contratos ADD COLUMN IF NOT EXISTS proyecto_mts2_snapshot DECIMAL(10, 2)`);
+
+    // proyectos: al crearse (ya sea automático desde una cotización aceptada o manualmente con
+    // "Crear Proyecto"), guarda su propia copia blindada del nombre/cédula/celular del cliente,
+    // para que sobreviva intacta aunque el cliente original se elimine de la pantalla de Clientes.
+    await pool.query(`ALTER TABLE proyectos ADD COLUMN IF NOT EXISTS cliente_nombre_snapshot VARCHAR(255)`);
+    await pool.query(`ALTER TABLE proyectos ADD COLUMN IF NOT EXISTS cliente_celular_snapshot VARCHAR(50)`);
+    await pool.query(`ALTER TABLE proyectos ADD COLUMN IF NOT EXISTS cliente_cedula_snapshot VARCHAR(50)`);
+
+    // movimientos_costos: registro día a día de cada compra/pago (materiales, mano de obra,
+    // imprevistos) con su detalle y valor, para llevar un historial en vez de solo un total
+    // editable a mano. Los totales de estadisticas_proyecto se recalculan sumando estos
+    // movimientos cada vez que se agrega uno nuevo.
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS movimientos_costos (
+        id SERIAL PRIMARY KEY,
+        proyecto_id INT NOT NULL,
+        tipo VARCHAR(20) NOT NULL,
+        detalle TEXT,
+        valor DECIMAL(12, 2) NOT NULL,
+        fecha DATE NOT NULL DEFAULT CURRENT_DATE,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_movimientos_costos_proyecto ON movimientos_costos(proyecto_id)`);
+
+    console.log('✅ Esquema verificado/actualizado correctamente');
+  } catch (error) {
+    // No tumbamos el servidor si esto falla: preferimos que la app siga funcionando con el
+    // esquema anterior a que un problema de migración deje todo caído (mismo criterio que
+    // firebaseAdmin.js).
+    console.error('❌ Error aplicando migraciones automáticas:', error.message);
+  }
+}
+
+module.exports = aplicarMigraciones;

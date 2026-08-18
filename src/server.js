@@ -3,10 +3,12 @@ const cors = require('cors');
 const bodyParser = require('body-parser');
 require('dotenv').config();
 const setupDatabase = require('./setup');
+const aplicarMigraciones = require('./migraciones');
 
 const app = express();
 
 setupDatabase();
+aplicarMigraciones();
 
 // Middleware
 app.use(cors());

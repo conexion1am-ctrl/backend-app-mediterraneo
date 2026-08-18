@@ -5,7 +5,6 @@ require('dotenv').config();
 const { generarPdfBuffer } = require('../utils/generarPdf');
 const { subirBufferAStorage, borrarArchivoDeStorage } = require('../utils/firebaseAdmin');
 const { esGerencia } = require('../utils/permisos');
-const { borrarDependenciasDeProyecto } = require('../utils/cascadaProyecto');
 
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
@@ -118,7 +117,13 @@ router.get('/:id', async (req, res) => {
   }
 });
 
-// ✅ ACEPTAR cotización → crea el proyecto (si no existía) y el contrato automáticamente
+// ✅ ACEPTAR cotización → crea SOLO el contrato (ya NO crea el proyecto automáticamente).
+// El proyecto se crea después, manualmente, con el botón "Crear Proyecto" en la pantalla de
+// Contratos (ver POST /contratos/:id/crear-proyecto más abajo). Esto permite que el usuario
+// pueda eliminar el proyecto sin perder el contrato, y volver a crearlo cuando lo necesite.
+// El contrato guarda un "snapshot" (copia propia, blindada) del nombre/dirección/m2 del
+// proyecto tal como estaban en el cliente al momento de aceptar, para poder crear el proyecto
+// más adelante con esos mismos datos aunque el cliente original ya no exista.
 router.post('/:id/aceptar', async (req, res) => {
   const client = await pool.connect();
   try {
@@ -137,56 +142,113 @@ router.post('/:id/aceptar', async (req, res) => {
 
     await client.query('BEGIN');
 
-    let proyectoId = cotizacion.proyecto_id;
-
-    // Si esta cotización no tiene un proyecto real todavía, lo creamos ahora
-    // usando el nombre de proyecto que el cliente indicó al ser registrado.
-    if (!proyectoId) {
-      const clienteResult = await client.query('SELECT * FROM clientes WHERE id = $1', [cotizacion.cliente_id]);
-      const cliente = clienteResult.rows[0];
-      const nombreProyecto = (cliente && cliente.nombre_proyecto) ? cliente.nombre_proyecto : `Proyecto de ${cliente ? cliente.nombre : 'cliente'}`;
-
-      // Arrastramos mts2 y dirección desde la ficha del cliente al crear el proyecto,
-      // para no tener que volver a escribirlos.
-      const nuevoProyecto = await client.query(
-        'INSERT INTO proyectos (empresa_id, nombre, direccion, area_m2) VALUES ($1, $2, $3, $4) RETURNING *',
-        [cotizacion.empresa_id, nombreProyecto, cliente?.direccion || null, cliente?.mts2 || null]
-      );
-      proyectoId = nuevoProyecto.rows[0].id;
-
-      // Vinculamos la cotización a este proyecto recién creado
-      await client.query('UPDATE cotizaciones SET proyecto_id = $1 WHERE id = $2', [proyectoId, id]);
-    }
+    const clienteResult = await client.query('SELECT * FROM clientes WHERE id = $1', [cotizacion.cliente_id]);
+    const cliente = clienteResult.rows[0];
+    const nombreProyecto = (cliente && cliente.nombre_proyecto) ? cliente.nombre_proyecto : `Proyecto de ${cliente ? cliente.nombre : 'cliente'}`;
 
     await client.query(
       "UPDATE cotizaciones SET aceptada = TRUE, estado = 'aceptada', updated_at = CURRENT_TIMESTAMP WHERE id = $1",
       [id]
     );
 
+    // El contrato nace SIN proyecto_id: el proyecto se crea después, a demanda, desde la
+    // pantalla de Contratos. Guardamos aquí el snapshot con el que se creará ese proyecto.
     const contratoResult = await client.query(
-      'INSERT INTO contratos (cotizacion_id, empresa_id, proyecto_id, fecha_entrega, valor_total) VALUES ($1, $2, $3, $4, $5) RETURNING *',
-      [id, cotizacion.empresa_id, proyectoId, fecha_entrega || null, cotizacion.total]
-    );
-
-    await client.query(
-      'INSERT INTO estadisticas_proyecto (proyecto_id, valor_contrato) VALUES ($1, $2)',
-      [proyectoId, cotizacion.total]
+      `INSERT INTO contratos
+        (cotizacion_id, empresa_id, proyecto_id, fecha_entrega, valor_total,
+         proyecto_nombre_snapshot, proyecto_direccion_snapshot, proyecto_mts2_snapshot)
+       VALUES ($1, $2, NULL, $3, $4, $5, $6, $7) RETURNING *`,
+      [id, cotizacion.empresa_id, fecha_entrega || null, cotizacion.total,
+       nombreProyecto, cliente?.direccion || null, cliente?.mts2 || null]
     );
 
     await client.query('COMMIT');
 
-    res.json({ mensaje: 'Cotización aceptada, proyecto y contrato generados exitosamente', contrato: contratoResult.rows[0], proyecto_id: proyectoId });
+    res.json({ mensaje: 'Cotización aceptada y contrato generado exitosamente', contrato: contratoResult.rows[0] });
 
     // Generar y subir el PDF del contrato DESPUÉS de responder, para no hacer esperar al
     // usuario ni bloquear la aceptación si Puppeteer falla o tarda. Es "best effort": si
     // falla, el contrato queda igual creado, solo sin pdf_url (se puede reintentar luego).
-    generarYGuardarPdfContrato(id, contratoResult.rows[0].id, proyectoId).catch((error) => {
+    generarYGuardarPdfContrato(id, contratoResult.rows[0].id, null).catch((error) => {
       console.error('Error generando PDF automático del contrato:', error.message);
     });
   } catch (error) {
     await client.query('ROLLBACK');
     console.error('Error aceptando cotización:', error);
     res.status(500).json({ error: 'Error al aceptar cotización' });
+  } finally {
+    client.release();
+  }
+});
+
+// 🏗️ CREAR PROYECTO a partir de un contrato ya aceptado que todavía no tiene proyecto (porque
+// nunca se creó, o porque se eliminó desde la pantalla de Proyectos). Usa el snapshot guardado
+// en el contrato (nombre/dirección/m2) y, si el cliente original todavía existe, también copia
+// su nombre/celular/cédula como snapshot PROPIO del proyecto — así el proyecto queda blindado:
+// aunque luego se borre el cliente o la cotización, el proyecto conserva esos datos.
+router.post('/contratos/:id/crear-proyecto', async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const { id } = req.params;
+
+    const contratoResult = await client.query('SELECT * FROM contratos WHERE id = $1', [id]);
+    if (contratoResult.rows.length === 0) {
+      return res.status(404).json({ error: 'Contrato no encontrado' });
+    }
+    const contrato = contratoResult.rows[0];
+
+    if (contrato.proyecto_id) {
+      return res.status(400).json({ error: 'Este contrato ya tiene un proyecto creado' });
+    }
+
+    await client.query('BEGIN');
+
+    let cliente = null;
+    if (contrato.cotizacion_id) {
+      const cotizacionResult = await client.query('SELECT cliente_id FROM cotizaciones WHERE id = $1', [contrato.cotizacion_id]);
+      const clienteId = cotizacionResult.rows[0]?.cliente_id;
+      if (clienteId) {
+        const clienteResult = await client.query('SELECT * FROM clientes WHERE id = $1', [clienteId]);
+        cliente = clienteResult.rows[0] || null;
+      }
+    }
+
+    const nuevoProyecto = await client.query(
+      `INSERT INTO proyectos
+        (empresa_id, nombre, direccion, area_m2, cliente_nombre_snapshot, cliente_celular_snapshot, cliente_cedula_snapshot)
+       VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING *`,
+      [
+        contrato.empresa_id,
+        contrato.proyecto_nombre_snapshot || 'Proyecto sin nombre',
+        contrato.proyecto_direccion_snapshot || null,
+        contrato.proyecto_mts2_snapshot || null,
+        cliente?.nombre || null,
+        cliente?.celular || null,
+        cliente?.cedula || null,
+      ]
+    );
+    const proyecto = nuevoProyecto.rows[0];
+
+    await client.query('UPDATE contratos SET proyecto_id = $1 WHERE id = $2', [proyecto.id, id]);
+    if (contrato.cotizacion_id) {
+      await client.query('UPDATE cotizaciones SET proyecto_id = $1 WHERE id = $2', [proyecto.id, contrato.cotizacion_id]);
+    }
+
+    const estadisticasExistentes = await client.query('SELECT id FROM estadisticas_proyecto WHERE proyecto_id = $1', [proyecto.id]);
+    if (estadisticasExistentes.rows.length === 0) {
+      await client.query(
+        'INSERT INTO estadisticas_proyecto (proyecto_id, valor_contrato) VALUES ($1, $2)',
+        [proyecto.id, contrato.valor_total]
+      );
+    }
+
+    await client.query('COMMIT');
+
+    res.status(201).json({ mensaje: 'Proyecto creado exitosamente', proyecto, contrato: { ...contrato, proyecto_id: proyecto.id } });
+  } catch (error) {
+    await client.query('ROLLBACK');
+    console.error('Error creando proyecto desde contrato:', error.message);
+    res.status(500).json({ error: 'No se pudo crear el proyecto. Intenta de nuevo.' });
   } finally {
     client.release();
   }
@@ -419,11 +481,13 @@ router.put('/:id/items-aceptada', async (req, res) => {
   }
 });
 
-// 🗑️ ELIMINAR contrato, la cotización que lo originó, y TODO el proyecto asociado (fotos,
-// planos 3D, mensajes/chat y sus adjuntos, equipo asignado, estadísticas), igual que al
-// eliminar un cliente. Solo GERENCIA puede hacerlo, ya que borra información comercial y de
-// obra definitiva. Libera de Firebase Storage el PDF del contrato y todos los archivos del
-// proyecto (fotos, planos .glb, adjuntos de chat).
+// 🗑️ ELIMINAR contrato y la cotización que lo originó. El PROYECTO YA NO SE BORRA: nació
+// blindado (con su propia copia de nombre/dirección/m2/cliente) precisamente para poder seguir
+// existiendo aunque el contrato o la cotización que lo originaron se eliminen. Si el contrato
+// tenía un proyecto vinculado, simplemente lo desvinculamos (proyecto_id = NULL en el proyecto
+// no aplica porque esa columna vive en contratos/cotizaciones, no en proyectos — el proyecto no
+// necesita saber nada del contrato para seguir funcionando). Solo GERENCIA puede eliminar
+// contratos. Libera de Firebase Storage el PDF del contrato.
 // IMPORTANTE: esta ruta debe declararse ANTES que DELETE /:id, si no Express interpretaría
 // "contratos" como si fuera el :id de una cotización.
 router.delete('/contratos/:id', async (req, res) => {
@@ -450,33 +514,20 @@ router.delete('/contratos/:id', async (req, res) => {
 
     await client.query('BEGIN');
 
-    // IMPORTANTE: el orden de borrado importa por las llaves foráneas. Seguimos el mismo
-    // patrón ya probado en clientes.js: primero se limpia todo lo que "cuelga" del proyecto
-    // (fotos, planos, chat, equipo, estadísticas), luego el proyecto, y el contrato se borra
-    // AL FINAL de todo (antes se borraba primero, lo que podía chocar con alguna referencia
-    // pendiente hacia el contrato y producir "No se pudo eliminar el contrato").
-    const proyectoId = contrato.proyecto_id;
-    if (proyectoId) {
-      const urlsDelProyecto = await borrarDependenciasDeProyecto(client, proyectoId);
-      urlsABorrar.push(...urlsDelProyecto);
-    }
+    // La FK real es contratos.cotizacion_id → cotizaciones.id: el contrato (tabla hija) debe
+    // borrarse antes que la cotización (tabla padre) que referencia.
+    const cotizacionId = contrato.cotizacion_id;
 
-    // El contrato tiene su propia fila en cotizacion_items/cotizaciones vinculada por
-    // cotizacion_id: borramos la cotización (y sus ítems) ANTES que el contrato, porque
-    // contratos.cotizacion_id apunta hacia cotizaciones.id (el contrato es el que depende
-    // de la cotización, no al revés).
-    if (contrato.cotizacion_id) {
-      await client.query('DELETE FROM cotizacion_items WHERE cotizacion_id = $1', [contrato.cotizacion_id]);
-      await client.query('DELETE FROM cotizaciones WHERE id = $1', [contrato.cotizacion_id]);
-    }
-
-    // El proyecto se borra después de vaciar todo lo que dependía de él.
-    if (proyectoId) {
-      await client.query('DELETE FROM proyectos WHERE id = $1', [proyectoId]);
-    }
-
-    // El contrato se borra al final: ya no queda ninguna fila en otras tablas que lo referencie.
     await client.query('DELETE FROM contratos WHERE id = $1', [id]);
+
+    if (cotizacionId) {
+      await client.query('DELETE FROM cotizacion_items WHERE cotizacion_id = $1', [cotizacionId]);
+      await client.query('DELETE FROM cotizaciones WHERE id = $1', [cotizacionId]);
+    }
+
+    // El proyecto NO se toca: queda intacto (blindado) con toda su información, aunque haya
+    // perdido el contrato/cotización que lo originaron. Se puede seguir viendo y usando
+    // normalmente desde la pantalla de Proyectos.
 
     await client.query('COMMIT');
 
@@ -486,7 +537,7 @@ router.delete('/contratos/:id', async (req, res) => {
       });
     }
 
-    res.json({ mensaje: 'Contrato, cotización y proyecto asociado eliminados exitosamente' });
+    res.json({ mensaje: 'Contrato y cotización eliminados exitosamente. El proyecto se conserva.' });
   } catch (error) {
     await client.query('ROLLBACK');
     // Loggeamos el detalle real de Postgres (código y tabla/constraint si viene), no solo el
@@ -498,16 +549,18 @@ router.delete('/contratos/:id', async (req, res) => {
   }
 });
 
-// 🗑️ ELIMINAR cotización. Solo Gerencia puede eliminarlas (mismo permiso que para contratos).
-// Si ya fue aceptada (tiene un contrato generado), primero hay que eliminar el contrato desde
-// la pantalla de Contratos (esto también elimina la cotización que lo originó, ver DELETE
-// /contratos/:id), para no dejar un contrato huérfano apuntando a una cotización inexistente.
+// 🗑️ ELIMINAR cotización. Solo Gerencia puede eliminarlas. Si ya fue aceptada (tiene un
+// contrato generado), se elimina también el contrato. El PROYECTO NO se borra: queda blindado
+// con su propia copia de datos, igual que al eliminar desde la pantalla de Contratos. Antes
+// esto estaba bloqueado y pedía eliminar el contrato primero; ahora se hace todo junto, en una
+// sola transacción, para no dejar nada huérfano.
 router.delete('/:id', async (req, res) => {
+  const client = await pool.connect();
   try {
     const { id } = req.params;
     const { solicitante_id } = req.body;
 
-    const cotizacionResult = await pool.query('SELECT * FROM cotizaciones WHERE id = $1', [id]);
+    const cotizacionResult = await client.query('SELECT * FROM cotizaciones WHERE id = $1', [id]);
     if (cotizacionResult.rows.length === 0) {
       return res.status(404).json({ error: 'Cotización no encontrada' });
     }
@@ -520,17 +573,40 @@ router.delete('/:id', async (req, res) => {
       }
     }
 
+    const urlsABorrar = [];
+    await client.query('BEGIN');
+
+    // Si esta cotización ya fue aceptada, busca su contrato y lo elimina también (por su FK
+    // hacia cotizaciones, el contrato debe irse antes que la cotización). El PROYECTO NO SE
+    // TOCA: nació blindado con su propia copia de datos y sigue existiendo aunque se borre la
+    // cotización/contrato que lo originaron.
     if (cotizacion.aceptada) {
-      return res.status(400).json({ error: 'No se puede eliminar una cotización ya aceptada (ya generó un contrato). Elimina primero el contrato desde la pantalla de Contratos.' });
+      const contratoResult = await client.query('SELECT * FROM contratos WHERE cotizacion_id = $1', [id]);
+      const contrato = contratoResult.rows[0];
+      if (contrato) {
+        if (contrato.pdf_url) urlsABorrar.push(contrato.pdf_url);
+        await client.query('DELETE FROM contratos WHERE id = $1', [contrato.id]);
+      }
     }
 
-    await pool.query('DELETE FROM cotizacion_items WHERE cotizacion_id = $1', [id]);
-    await pool.query('DELETE FROM cotizaciones WHERE id = $1', [id]);
+    await client.query('DELETE FROM cotizacion_items WHERE cotizacion_id = $1', [id]);
+    await client.query('DELETE FROM cotizaciones WHERE id = $1', [id]);
+
+    await client.query('COMMIT');
+
+    for (const url of urlsABorrar) {
+      await borrarArchivoDeStorage(url).catch((error) => {
+        console.error('Error borrando archivo de Storage al eliminar cotización:', error.message);
+      });
+    }
 
     res.json({ mensaje: 'Cotización eliminada exitosamente' });
   } catch (error) {
-    console.error('Error eliminando cotización:', error);
+    await client.query('ROLLBACK');
+    console.error('Error eliminando cotización:', error.message, '| code:', error.code, '| detail:', error.detail, '| constraint:', error.constraint, '| table:', error.table);
     res.status(500).json({ error: 'Error al eliminar cotización' });
+  } finally {
+    client.release();
   }
 });
 

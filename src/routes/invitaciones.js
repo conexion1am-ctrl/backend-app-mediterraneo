@@ -159,9 +159,25 @@ router.post('/aceptar/:token', async (req, res) => {
 
     delete usuario.contraseña_hash;
 
+    // Traemos TODAS las empresas/áreas activas de este usuario (puede que ya perteneciera a
+    // otras antes de esta invitación), con el mismo formato que devuelve /auth/login — así el
+    // frontend puede guardar la sesión y entrar directo a la app, sin tener que loguearse de
+    // nuevo con celular/contraseña justo después de haber creado la contraseña.
+    const rolesResult = await client.query(
+      `SELECT uer.empresa_id, e.nombre AS empresa_nombre, e.logo_url, e.color_hex, e.sitio_web,
+              e.nit, e.cedula_representante, e.banco_nombre, e.banco_tipo_cuenta, e.banco_numero, e.banco_titular,
+              a.id AS area_id, a.nombre AS area_nombre, a.tipo AS area_tipo
+       FROM usuario_empresa_rol uer
+       JOIN empresas e ON e.id = uer.empresa_id
+       JOIN areas_catalogo a ON a.id = uer.area_id
+       WHERE uer.usuario_id = $1 AND uer.estado = 'activo' AND e.estado = 'activo'`,
+      [usuario.id]
+    );
+
     res.json({
       mensaje: 'Invitación aceptada, usuario vinculado exitosamente',
-      usuario
+      usuario,
+      empresas: rolesResult.rows,
     });
   } catch (error) {
     await client.query('ROLLBACK');

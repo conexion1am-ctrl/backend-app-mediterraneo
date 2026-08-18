@@ -2,6 +2,9 @@ const express = require('express');
 const { Pool } = require('pg');
 const router = express.Router();
 require('dotenv').config();
+const { esGerencia } = require('../utils/permisos');
+const { borrarArchivoDeStorage } = require('../utils/firebaseAdmin');
+const { borrarDependenciasDeProyecto } = require('../utils/cascadaProyecto');
 
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
@@ -250,23 +253,66 @@ router.put('/:id/reactivar', async (req, res) => {
   }
 });
 
-// 🗑️ ELIMINAR proyecto (soft delete)
+// 🗑️ ELIMINAR proyecto de verdad (ya no es soft-delete), junto con todo lo que cuelga de él
+// (fotos, planos 3D, chat y adjuntos, equipo asignado, estadísticas, abonos, actividades),
+// limpiando también los archivos en Firebase Storage. El CONTRATO y la COTIZACIÓN que lo
+// originaron NO se tocan: solo se desvinculan (proyecto_id = NULL), porque el contrato ya
+// guarda su propio snapshot del proyecto y puede volver a crearlo con "Crear Proyecto" cuando
+// se necesite. Solo Gerencia puede eliminar proyectos.
 router.delete('/:id', async (req, res) => {
+  const client = await pool.connect();
   try {
     const { id } = req.params;
-    const result = await pool.query(
-      "UPDATE proyectos SET estado = 'eliminado', updated_at = CURRENT_TIMESTAMP WHERE id = $1 RETURNING *",
-      [id]
+    const { usuario_id } = req.body;
+
+    const proyectoResult = await client.query('SELECT * FROM proyectos WHERE id = $1', [id]);
+    if (proyectoResult.rows.length === 0) {
+      return res.status(404).json({ error: 'Proyecto no encontrado' });
+    }
+    const proyecto = proyectoResult.rows[0];
+
+    if (usuario_id) {
+      const esGerenciaDeEstaEmpresa = await esGerencia(usuario_id, proyecto.empresa_id);
+      if (!esGerenciaDeEstaEmpresa) {
+        return res.status(403).json({ error: 'Solo Gerencia puede eliminar proyectos' });
+      }
+    }
+
+    await client.query('BEGIN');
+
+    // Guardamos snapshot del proyecto en el contrato (si no lo tenía ya) ANTES de borrarlo,
+    // para que "Crear Proyecto" pueda recrearlo con los mismos datos más adelante.
+    await client.query(
+      `UPDATE contratos SET
+         proyecto_nombre_snapshot = COALESCE(proyecto_nombre_snapshot, $1),
+         proyecto_direccion_snapshot = COALESCE(proyecto_direccion_snapshot, $2),
+         proyecto_mts2_snapshot = COALESCE(proyecto_mts2_snapshot, $3)
+       WHERE proyecto_id = $4`,
+      [proyecto.nombre, proyecto.direccion, proyecto.area_m2, id]
     );
 
-    if (result.rows.length === 0) {
-      return res.status(404).json({ error: 'Proyecto no encontrado' });
+    // borrarDependenciasDeProyecto ya desvincula las cotizaciones (proyecto_id = NULL).
+    // Los contratos también quedan desvinculados, conservándose intactos.
+    const urlsABorrar = await borrarDependenciasDeProyecto(client, id);
+    await client.query('UPDATE contratos SET proyecto_id = NULL WHERE proyecto_id = $1', [id]);
+
+    await client.query('DELETE FROM proyectos WHERE id = $1', [id]);
+
+    await client.query('COMMIT');
+
+    for (const url of urlsABorrar) {
+      await borrarArchivoDeStorage(url).catch((error) => {
+        console.error('Error borrando archivo de Storage al eliminar proyecto:', error.message);
+      });
     }
 
     res.json({ mensaje: 'Proyecto eliminado exitosamente' });
   } catch (error) {
-    console.error('Error eliminando proyecto:', error);
-    res.status(500).json({ error: 'Error al eliminar proyecto' });
+    await client.query('ROLLBACK');
+    console.error('Error eliminando proyecto:', error.message, '| code:', error.code, '| detail:', error.detail, '| constraint:', error.constraint, '| table:', error.table);
+    res.status(500).json({ error: 'No se pudo eliminar el proyecto. Intenta de nuevo.' });
+  } finally {
+    client.release();
   }
 });
 

@@ -56,8 +56,13 @@ router.post('/login', async (req, res) => {
     const usuario = usuarioResult.rows[0];
 
     // Traer todas sus empresas y roles (solo empresas activas, no eliminadas)
+    // Traemos también nit/cedula_representante/datos bancarios: antes no se incluían aquí, así
+    // que aunque quedaban bien guardados en la base de datos, la sesión guardada en el celular
+    // (usada para no pedir contraseña de nuevo) nunca los tenía — por eso "desaparecían" al
+    // cerrar sesión y volver a entrar, aunque en el servidor sí estaban guardados.
     const rolesResult = await pool.query(
       `SELECT uer.empresa_id, e.nombre AS empresa_nombre, e.logo_url, e.color_hex, e.sitio_web,
+              e.nit, e.cedula_representante, e.banco_nombre, e.banco_tipo_cuenta, e.banco_numero, e.banco_titular,
               a.id AS area_id, a.nombre AS area_nombre, a.tipo AS area_tipo
        FROM usuario_empresa_rol uer
        JOIN empresas e ON e.id = uer.empresa_id
