@@ -153,6 +153,14 @@ router.post('/aceptar/:token', async (req, res) => {
       [usuario.id, invitacion.empresa_id, invitacion.area_id, 'activo']
     );
 
+    // Si esta persona ya había sido asignada a algún proyecto mientras estaba "pendiente"
+    // (proyecto_equipo.invitacion_id), ahora que tiene usuario real esas filas se completan con
+    // su usuario_id, para que dejen de figurar como pendientes en el equipo del proyecto.
+    await client.query(
+      'UPDATE proyecto_equipo SET usuario_id = $1, invitacion_id = NULL WHERE invitacion_id = $2',
+      [usuario.id, invitacion.id]
+    );
+
     await client.query('UPDATE invitaciones SET usado = TRUE WHERE token = $1', [token]);
 
     await client.query('COMMIT');

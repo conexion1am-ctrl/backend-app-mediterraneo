@@ -91,18 +91,21 @@ router.get('/:id', async (req, res) => {
 });
 
 // 👥 ASIGNAR personal a un área dentro de un proyecto (pantalla Equipo)
+// Acepta tanto personal ya vinculado (usuario_id) como personal invitado que aún no acepta
+// su invitación (invitacion_id) — esto último para que la persona quede visible en el equipo
+// del proyecto desde ya, sin tener que esperar a que acepte el link.
 router.post('/:id/equipo/asignar', async (req, res) => {
   try {
     const { id } = req.params;
-    const { usuario_id, area_id } = req.body;
+    const { usuario_id, invitacion_id, area_id } = req.body;
 
-    if (!usuario_id || !area_id) {
-      return res.status(400).json({ error: 'usuario_id y area_id son obligatorios' });
+    if ((!usuario_id && !invitacion_id) || !area_id) {
+      return res.status(400).json({ error: 'area_id y (usuario_id o invitacion_id) son obligatorios' });
     }
 
     const result = await pool.query(
-      'INSERT INTO proyecto_equipo (proyecto_id, usuario_id, area_id) VALUES ($1, $2, $3) RETURNING *',
-      [id, usuario_id, area_id]
+      'INSERT INTO proyecto_equipo (proyecto_id, usuario_id, invitacion_id, area_id) VALUES ($1, $2, $3, $4) RETURNING *',
+      [id, usuario_id || null, invitacion_id || null, area_id]
     );
 
     res.status(201).json({ mensaje: 'Persona asignada al proyecto exitosamente', asignacion: result.rows[0] });
@@ -113,13 +116,21 @@ router.post('/:id/equipo/asignar', async (req, res) => {
 });
 
 // 👥 VER equipo asignado a un proyecto (agrupado por área)
+// Trae tanto personal ya vinculado (usuario real) como personal pendiente (invitación sin
+// aceptar todavía), para que gerencia pueda ver quién quedó asignado desde el primer momento.
 router.get('/:id/equipo', async (req, res) => {
   try {
     const { id } = req.params;
     const result = await pool.query(
-      `SELECT pe.id AS asignacion_id, u.id AS usuario_id, u.nombre, u.celular, a.id AS area_id, a.nombre AS area_nombre
+      `SELECT pe.id AS asignacion_id,
+              COALESCE(u.id, NULL) AS usuario_id,
+              COALESCE(u.nombre, i.nombre_invitado) AS nombre,
+              COALESCE(u.celular, i.celular_invitado) AS celular,
+              a.id AS area_id, a.nombre AS area_nombre,
+              CASE WHEN pe.usuario_id IS NOT NULL THEN 'vinculado' ELSE 'pendiente' END AS estado
        FROM proyecto_equipo pe
-       JOIN usuarios u ON u.id = pe.usuario_id
+       LEFT JOIN usuarios u ON u.id = pe.usuario_id
+       LEFT JOIN invitaciones i ON i.id = pe.invitacion_id
        JOIN areas_catalogo a ON a.id = pe.area_id
        WHERE pe.proyecto_id = $1
        ORDER BY a.nombre`,

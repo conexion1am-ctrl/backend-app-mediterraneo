@@ -50,6 +50,26 @@ async function aplicarMigraciones() {
     `);
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_movimientos_costos_proyecto ON movimientos_costos(proyecto_id)`);
 
+    // proyecto_equipo: hasta ahora solo se podía asignar a alguien que YA hubiera aceptado su
+    // invitación (usuario_id NOT NULL, con usuario real creado). Esto impedía ver/asignar a
+    // personal invitado que todavía no acepta el link. Ahora usuario_id puede quedar en NULL
+    // mientras la persona esté pendiente, y invitacion_id guarda a cuál invitación corresponde
+    // esa asignación "provisional". Cuando la persona acepta la invitación, invitaciones.js migra
+    // automáticamente estas filas de invitacion_id a usuario_id real (ver POST /aceptar/:token).
+    await pool.query(`ALTER TABLE proyecto_equipo ALTER COLUMN usuario_id DROP NOT NULL`);
+    await pool.query(`ALTER TABLE proyecto_equipo ADD COLUMN IF NOT EXISTS invitacion_id INT REFERENCES invitaciones(id)`);
+    // Evita asignar dos veces a la misma persona pendiente en el mismo proyecto+área.
+    await pool.query(`
+      DO $$ BEGIN
+        IF NOT EXISTS (
+          SELECT 1 FROM pg_constraint WHERE conname = 'proyecto_equipo_invitacion_unica'
+        ) THEN
+          ALTER TABLE proyecto_equipo
+            ADD CONSTRAINT proyecto_equipo_invitacion_unica UNIQUE (proyecto_id, invitacion_id, area_id);
+        END IF;
+      END $$;
+    `);
+
     console.log('✅ Esquema verificado/actualizado correctamente');
   } catch (error) {
     // No tumbamos el servidor si esto falla: preferimos que la app siga funcionando con el
