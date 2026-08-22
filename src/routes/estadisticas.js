@@ -298,4 +298,49 @@ router.post('/:proyecto_id/abono', async (req, res) => {
   }
 });
 
+// ✏️ EDITAR un abono ya registrado (por si el cliente dice que abonó un valor distinto al que
+// se ingresó por error, o hay que corregir la fecha).
+router.put('/abono/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { valor, fecha } = req.body;
+
+    if (!valor || !fecha) {
+      return res.status(400).json({ error: 'valor y fecha son obligatorios' });
+    }
+
+    const result = await pool.query(
+      'UPDATE abonos_proyecto SET valor = $1, fecha = $2 WHERE id = $3 RETURNING *',
+      [valor, fecha, id]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Abono no encontrado' });
+    }
+
+    res.json({ mensaje: 'Abono actualizado exitosamente', abono: result.rows[0] });
+  } catch (error) {
+    console.error('Error editando abono:', error);
+    res.status(500).json({ error: 'Error al editar el abono' });
+  }
+});
+
+// 🗑️ ELIMINAR un abono (por si se registró por error, ej. un abono duplicado o un valor
+// completamente equivocado que es más fácil borrar que corregir).
+router.delete('/abono/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const result = await pool.query('DELETE FROM abonos_proyecto WHERE id = $1 RETURNING *', [id]);
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Abono no encontrado' });
+    }
+
+    res.json({ mensaje: 'Abono eliminado exitosamente' });
+  } catch (error) {
+    console.error('Error eliminando abono:', error);
+    res.status(500).json({ error: 'Error al eliminar el abono' });
+  }
+});
+
 module.exports = router;
