@@ -2,6 +2,7 @@ const express = require('express');
 const { Pool } = require('pg');
 const router = express.Router();
 require('dotenv').config();
+const { borrarArchivoDeStorage } = require('../utils/firebaseAdmin');
 
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
@@ -150,6 +151,48 @@ router.post('/adjuntar', async (req, res) => {
   } catch (error) {
     console.error('Error adjuntando archivo:', error);
     res.status(500).json({ error: 'Error al adjuntar archivo' });
+  }
+});
+
+// 🗑️ ELIMINAR un mensaje: borra la fila, sus archivos adjuntos reales en Firebase Storage (si
+// tenía foto/documento/nota de voz) y las filas de la tabla archivos, para no dejar nada
+// huérfano. Solo el usuario que lo envió puede eliminarlo (recibimos su usuario_id y lo
+// comparamos contra el dueño real del mensaje, no confiamos en lo que mande el frontend).
+router.delete('/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { usuario_id } = req.body;
+
+    if (!usuario_id) {
+      return res.status(400).json({ error: 'usuario_id es obligatorio' });
+    }
+
+    const mensajeResult = await pool.query('SELECT * FROM mensajes WHERE id = $1', [id]);
+    if (mensajeResult.rows.length === 0) {
+      return res.status(404).json({ error: 'Mensaje no encontrado' });
+    }
+
+    const mensaje = mensajeResult.rows[0];
+    if (mensaje.usuario_id !== Number(usuario_id)) {
+      return res.status(403).json({ error: 'Solo quien envió el mensaje puede eliminarlo' });
+    }
+
+    const archivosResult = await pool.query('SELECT * FROM archivos WHERE mensaje_id = $1', [id]);
+
+    // Se borran primero los archivos reales en Storage (fuera de la base de datos), y solo
+    // después las filas — si algo falla borrando de Storage, mejor que sobre un registro en la
+    // base de datos a que quede un archivo real huérfano sin ninguna referencia en ningún lado.
+    for (const archivo of archivosResult.rows) {
+      await borrarArchivoDeStorage(archivo.url_archivo);
+    }
+
+    await pool.query('DELETE FROM archivos WHERE mensaje_id = $1', [id]);
+    await pool.query('DELETE FROM mensajes WHERE id = $1', [id]);
+
+    res.json({ mensaje: 'Mensaje eliminado exitosamente' });
+  } catch (error) {
+    console.error('Error eliminando mensaje:', error);
+    res.status(500).json({ error: 'Error al eliminar el mensaje' });
   }
 });
 
