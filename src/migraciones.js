@@ -70,6 +70,38 @@ async function aplicarMigraciones() {
       END $$;
     `);
 
+    // categorias_costo: rubros reutilizables (ej. "Carpintería", "Ferretería", "Estuco") que el
+    // usuario crea una vez por empresa y luego usa para etiquetar cada movimiento de costo
+    // (materiales, mano de obra o imprevistos), sin importar en qué proyecto esté. Así puede ver
+    // después cuánto costó REALMENTE un rubro completo, sumando sus materiales + mano de obra +
+    // imprevistos, en vez de solo el total genérico por tipo.
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS categorias_costo (
+        id SERIAL PRIMARY KEY,
+        empresa_id INT NOT NULL,
+        nombre VARCHAR(100) NOT NULL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_categorias_costo_empresa ON categorias_costo(empresa_id)`);
+    // Evita crear la misma categoría dos veces (por nombre) dentro de la misma empresa.
+    await pool.query(`
+      DO $$ BEGIN
+        IF NOT EXISTS (
+          SELECT 1 FROM pg_constraint WHERE conname = 'categorias_costo_empresa_nombre_unica'
+        ) THEN
+          ALTER TABLE categorias_costo
+            ADD CONSTRAINT categorias_costo_empresa_nombre_unica UNIQUE (empresa_id, nombre);
+        END IF;
+      END $$;
+    `);
+
+    // categoria_id en movimientos_costos: NULLABLE a propósito, para no romper los movimientos
+    // que ya existían antes de esta función (quedan "sin categoría", agrupados aparte). ON
+    // DELETE SET NULL: si se borra una categoría, los movimientos que la usaban no se pierden,
+    // simplemente quedan sin categoría otra vez.
+    await pool.query(`ALTER TABLE movimientos_costos ADD COLUMN IF NOT EXISTS categoria_id INT REFERENCES categorias_costo(id) ON DELETE SET NULL`);
+
     console.log('✅ Esquema verificado/actualizado correctamente');
   } catch (error) {
     // No tumbamos el servidor si esto falla: preferimos que la app siga funcionando con el

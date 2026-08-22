@@ -8,8 +8,10 @@ const pool = new Pool({
   ssl: { rejectUnauthorized: false }
 });
 
-// 👁️ VER estadísticas de un proyecto (incluye utilidad calculada y el historial de movimientos
-// de costos, agrupado por tipo: materiales, mano_obra, imprevistos)
+// 👁️ VER estadísticas de un proyecto (incluye utilidad calculada, el historial de movimientos
+// de costos agrupado por tipo: materiales, mano_obra, imprevistos, y un resumen por CATEGORÍA
+// -carpintería, ferretería, estuco, etc- que suma materiales + mano de obra + imprevistos de
+// cada rubro, para saber cuánto costó REALMENTE cada uno).
 router.get('/:proyecto_id', async (req, res) => {
   try {
     const { proyecto_id } = req.params;
@@ -25,8 +27,31 @@ router.get('/:proyecto_id', async (req, res) => {
       [proyecto_id]
     );
 
+    // Traemos cada movimiento con el nombre de su categoría ya resuelto (si tiene una), para que
+    // el frontend no tenga que cruzar listas por separado.
     const movimientosResult = await pool.query(
-      'SELECT * FROM movimientos_costos WHERE proyecto_id = $1 ORDER BY fecha DESC, created_at DESC',
+      `SELECT m.*, c.nombre AS categoria_nombre
+       FROM movimientos_costos m
+       LEFT JOIN categorias_costo c ON c.id = m.categoria_id
+       WHERE m.proyecto_id = $1
+       ORDER BY m.fecha DESC, m.created_at DESC`,
+      [proyecto_id]
+    );
+
+    // Resumen por categoría: cuánto se lleva gastado en cada rubro (sumando materiales + mano de
+    // obra + imprevistos juntos), para responder "cuánto me costó realmente el estuco". Los
+    // movimientos sin categoría no entran aquí (se ven igual en el historial, solo sin agrupar).
+    const resumenPorCategoriaResult = await pool.query(
+      `SELECT c.id AS categoria_id, c.nombre AS categoria_nombre,
+              COALESCE(SUM(m.valor) FILTER (WHERE m.tipo = 'materiales'), 0) AS total_materiales,
+              COALESCE(SUM(m.valor) FILTER (WHERE m.tipo = 'mano_obra'), 0) AS total_mano_obra,
+              COALESCE(SUM(m.valor) FILTER (WHERE m.tipo = 'imprevistos'), 0) AS total_imprevistos,
+              COALESCE(SUM(m.valor), 0) AS total
+       FROM movimientos_costos m
+       JOIN categorias_costo c ON c.id = m.categoria_id
+       WHERE m.proyecto_id = $1
+       GROUP BY c.id, c.nombre
+       ORDER BY total DESC`,
       [proyecto_id]
     );
 
@@ -39,6 +64,7 @@ router.get('/:proyecto_id', async (req, res) => {
       ...stats,
       abonos: abonosResult.rows,
       movimientos_costos: movimientosResult.rows,
+      resumen_por_categoria: resumenPorCategoriaResult.rows,
       total_abonado: totalAbonado,
       saldo_pendiente: parseFloat(stats.valor_contrato) - totalAbonado,
       utilidad
@@ -46,6 +72,69 @@ router.get('/:proyecto_id', async (req, res) => {
   } catch (error) {
     console.error('Error obteniendo estadísticas:', error);
     res.status(500).json({ error: 'Error al obtener estadísticas' });
+  }
+});
+
+// 👁️ LISTAR las categorías de costo de una empresa (ej. Carpintería, Ferretería, Estuco),
+// ordenadas alfabéticamente para que sean fáciles de encontrar en la lista.
+router.get('/categorias/:empresa_id', async (req, res) => {
+  try {
+    const { empresa_id } = req.params;
+    const result = await pool.query(
+      'SELECT * FROM categorias_costo WHERE empresa_id = $1 ORDER BY nombre ASC',
+      [empresa_id]
+    );
+    res.json({ categorias: result.rows });
+  } catch (error) {
+    console.error('Error listando categorías de costo:', error);
+    res.status(500).json({ error: 'Error al listar categorías de costo' });
+  }
+});
+
+// 📝 CREAR una categoría de costo nueva (ej. cuando el usuario escribe "Estuco" por primera
+// vez). Si ya existe una con el mismo nombre en esa empresa, devolvemos la existente en vez de
+// duplicarla (evita categorías repetidas por mayúsculas/espacios o toques accidentales dobles).
+router.post('/categorias', async (req, res) => {
+  try {
+    const { empresa_id, nombre } = req.body;
+    if (!empresa_id || !nombre || !nombre.trim()) {
+      return res.status(400).json({ error: 'empresa_id y nombre son obligatorios' });
+    }
+
+    const nombreLimpio = nombre.trim();
+    const existente = await pool.query(
+      'SELECT * FROM categorias_costo WHERE empresa_id = $1 AND LOWER(nombre) = LOWER($2)',
+      [empresa_id, nombreLimpio]
+    );
+    if (existente.rows.length > 0) {
+      return res.status(200).json({ mensaje: 'La categoría ya existía', categoria: existente.rows[0] });
+    }
+
+    const result = await pool.query(
+      'INSERT INTO categorias_costo (empresa_id, nombre) VALUES ($1, $2) RETURNING *',
+      [empresa_id, nombreLimpio]
+    );
+    res.status(201).json({ mensaje: 'Categoría creada exitosamente', categoria: result.rows[0] });
+  } catch (error) {
+    console.error('Error creando categoría de costo:', error);
+    res.status(500).json({ error: 'Error al crear la categoría' });
+  }
+});
+
+// 🗑️ ELIMINAR una categoría de costo. Los movimientos que la usaban NO se borran, solo quedan
+// sin categoría (ver ON DELETE SET NULL en migraciones.js), para no perder el historial de
+// gastos ya registrado.
+router.delete('/categorias/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const result = await pool.query('DELETE FROM categorias_costo WHERE id = $1 RETURNING *', [id]);
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Categoría no encontrada' });
+    }
+    res.json({ mensaje: 'Categoría eliminada exitosamente' });
+  } catch (error) {
+    console.error('Error eliminando categoría de costo:', error);
+    res.status(500).json({ error: 'Error al eliminar la categoría' });
   }
 });
 
@@ -57,7 +146,7 @@ router.post('/:proyecto_id/movimiento', async (req, res) => {
   const client = await pool.connect();
   try {
     const { proyecto_id } = req.params;
-    const { tipo, detalle, valor, fecha } = req.body;
+    const { tipo, detalle, valor, fecha, categoria_id } = req.body;
 
     const tiposValidos = ['materiales', 'mano_obra', 'imprevistos'];
     if (!tiposValidos.includes(tipo)) {
@@ -70,8 +159,8 @@ router.post('/:proyecto_id/movimiento', async (req, res) => {
     await client.query('BEGIN');
 
     const movimiento = await client.query(
-      'INSERT INTO movimientos_costos (proyecto_id, tipo, detalle, valor, fecha) VALUES ($1, $2, $3, $4, COALESCE($5, CURRENT_DATE)) RETURNING *',
-      [proyecto_id, tipo, detalle || null, valor, fecha || null]
+      'INSERT INTO movimientos_costos (proyecto_id, tipo, detalle, valor, fecha, categoria_id) VALUES ($1, $2, $3, $4, COALESCE($5, CURRENT_DATE), $6) RETURNING *',
+      [proyecto_id, tipo, detalle || null, valor, fecha || null, categoria_id || null]
     );
 
     const columna = tipo === 'materiales' ? 'costos_materiales' : tipo === 'mano_obra' ? 'valor_mano_obra' : 'valor_imprevistos';
