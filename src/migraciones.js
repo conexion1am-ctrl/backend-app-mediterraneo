@@ -102,6 +102,14 @@ async function aplicarMigraciones() {
     // simplemente quedan sin categoría otra vez.
     await pool.query(`ALTER TABLE movimientos_costos ADD COLUMN IF NOT EXISTS categoria_id INT REFERENCES categorias_costo(id) ON DELETE SET NULL`);
 
+    // pausado en proyecto_equipo: permite a gerencia "pausar" el acceso de una persona a un
+    // proyecto sin desasignarla del todo (a diferencia de eliminar la fila, que borra la
+    // asignación por completo). Mientras está pausada, GET /asignaciones/:usuario_id la excluye,
+    // así que la persona deja de ver ese proyecto en su lista — es un bloqueo real de acceso, no
+    // solo una etiqueta visual. Volver a "despausar" restaura el acceso sin tener que re-asignar
+    // desde cero (conserva el historial del chat que ya tenían).
+    await pool.query(`ALTER TABLE proyecto_equipo ADD COLUMN IF NOT EXISTS pausado BOOLEAN NOT NULL DEFAULT false`);
+
     console.log('✅ Esquema verificado/actualizado correctamente');
   } catch (error) {
     // No tumbamos el servidor si esto falla: preferimos que la app siga funcionando con el

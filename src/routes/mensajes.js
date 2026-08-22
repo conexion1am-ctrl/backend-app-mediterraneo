@@ -196,4 +196,52 @@ router.delete('/:id', async (req, res) => {
   }
 });
 
+// Vacía COMPLETAMENTE el chat individual entre dos personas dentro de un proyecto+área: borra
+// todos los mensajes en ambos sentidos (sin importar quién envió cada uno) y todos sus archivos
+// adjuntos reales en Firebase Storage. Se exporta como función aparte (no solo como ruta HTTP)
+// para poder reutilizarla desde proyectos_v2.js cuando se elimina a alguien del proyecto por
+// completo — ahí también hay que vaciar el chat, y así no se duplica la lógica de borrado.
+async function vaciarChat(client, proyecto_id, area_id, usuario_a, usuario_b) {
+  const mensajesResult = await client.query(
+    `SELECT id FROM mensajes
+     WHERE proyecto_id = $1 AND area_id = $2
+       AND ((usuario_id = $3 AND destinatario_usuario_id = $4) OR (usuario_id = $4 AND destinatario_usuario_id = $3))`,
+    [proyecto_id, area_id, usuario_a, usuario_b]
+  );
+  const idsMensajes = mensajesResult.rows.map((m) => m.id);
+  if (idsMensajes.length === 0) return;
+
+  const archivosResult = await client.query('SELECT * FROM archivos WHERE mensaje_id = ANY($1::int[])', [idsMensajes]);
+  for (const archivo of archivosResult.rows) {
+    await borrarArchivoDeStorage(archivo.url_archivo).catch((error) => {
+      console.error('Error borrando archivo de Storage al vaciar chat:', error.message);
+    });
+  }
+
+  await client.query('DELETE FROM archivos WHERE mensaje_id = ANY($1::int[])', [idsMensajes]);
+  await client.query('DELETE FROM mensajes WHERE id = ANY($1::int[])', [idsMensajes]);
+}
+
+// 🗑️ VACIAR chat completo con una persona, dentro de un proyecto y área (endpoint HTTP, usado
+// desde el menú de long-press en el equipo del proyecto — "Eliminar chat"). Cualquiera de los
+// dos participantes del chat puede vaciarlo, a diferencia de eliminar un solo mensaje (que solo
+// puede hacerlo quien lo envió).
+router.delete('/vaciar/:proyecto_id/:area_id/:usuario_a/:usuario_b', async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const { proyecto_id, area_id, usuario_a, usuario_b } = req.params;
+    await client.query('BEGIN');
+    await vaciarChat(client, proyecto_id, area_id, usuario_a, usuario_b);
+    await client.query('COMMIT');
+    res.json({ mensaje: 'Chat vaciado exitosamente' });
+  } catch (error) {
+    await client.query('ROLLBACK');
+    console.error('Error vaciando chat:', error);
+    res.status(500).json({ error: 'Error al vaciar el chat' });
+  } finally {
+    client.release();
+  }
+});
+
 module.exports = router;
+module.exports.vaciarChat = vaciarChat;

@@ -187,6 +187,63 @@ router.post('/:proyecto_id/movimiento', async (req, res) => {
   }
 });
 
+// ✏️ EDITAR un movimiento de costo ya registrado (por si se equivocaron al escribir el valor de
+// una factura, la fecha, el detalle o la categoría). Recalcula los totales de
+// estadisticas_proyecto: primero resta el valor VIEJO de su columna, y suma el valor NUEVO a su
+// columna correspondiente — así funciona correctamente incluso si además de cambiar el valor,
+// también cambia el tipo (ej. lo habían puesto como "imprevistos" y en realidad era "materiales").
+router.put('/movimiento/:id', async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const { id } = req.params;
+    const { tipo, detalle, valor, fecha, categoria_id } = req.body;
+
+    const tiposValidos = ['materiales', 'mano_obra', 'imprevistos'];
+    if (!tiposValidos.includes(tipo)) {
+      return res.status(400).json({ error: 'Tipo de costo inválido' });
+    }
+    if (!valor || parseFloat(valor) <= 0) {
+      return res.status(400).json({ error: 'El valor debe ser mayor a 0' });
+    }
+
+    const movimientoResult = await client.query('SELECT * FROM movimientos_costos WHERE id = $1', [id]);
+    if (movimientoResult.rows.length === 0) {
+      return res.status(404).json({ error: 'Movimiento no encontrado' });
+    }
+    const movimientoViejo = movimientoResult.rows[0];
+    const columnaVieja = movimientoViejo.tipo === 'materiales' ? 'costos_materiales' : movimientoViejo.tipo === 'mano_obra' ? 'valor_mano_obra' : 'valor_imprevistos';
+    const columnaNueva = tipo === 'materiales' ? 'costos_materiales' : tipo === 'mano_obra' ? 'valor_mano_obra' : 'valor_imprevistos';
+
+    await client.query('BEGIN');
+
+    // Revierte el valor viejo de su columna original.
+    await client.query(
+      `UPDATE estadisticas_proyecto SET ${columnaVieja} = GREATEST(${columnaVieja} - $1, 0), updated_at = CURRENT_TIMESTAMP WHERE proyecto_id = $2`,
+      [movimientoViejo.valor, movimientoViejo.proyecto_id]
+    );
+    // Suma el valor nuevo a su columna correspondiente (puede ser la misma columna de antes).
+    const estadisticas = await client.query(
+      `UPDATE estadisticas_proyecto SET ${columnaNueva} = ${columnaNueva} + $1, updated_at = CURRENT_TIMESTAMP WHERE proyecto_id = $2 RETURNING *`,
+      [valor, movimientoViejo.proyecto_id]
+    );
+
+    const movimiento = await client.query(
+      'UPDATE movimientos_costos SET tipo = $1, detalle = $2, valor = $3, fecha = COALESCE($4, fecha), categoria_id = $5 WHERE id = $6 RETURNING *',
+      [tipo, detalle || null, valor, fecha || null, categoria_id || null, id]
+    );
+
+    await client.query('COMMIT');
+
+    res.json({ mensaje: 'Movimiento actualizado exitosamente', movimiento: movimiento.rows[0], estadisticas: estadisticas.rows[0] });
+  } catch (error) {
+    await client.query('ROLLBACK');
+    console.error('Error editando movimiento de costo:', error);
+    res.status(500).json({ error: 'Error al editar el movimiento' });
+  } finally {
+    client.release();
+  }
+});
+
 // 🗑️ ELIMINAR un movimiento de costo (por si se registró por error), restando su valor del
 // total de esa categoría.
 router.delete('/movimiento/:id', async (req, res) => {

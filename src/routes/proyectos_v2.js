@@ -5,6 +5,7 @@ require('dotenv').config();
 const { esGerencia } = require('../utils/permisos');
 const { borrarArchivoDeStorage } = require('../utils/firebaseAdmin');
 const { borrarDependenciasDeProyecto } = require('../utils/cascadaProyecto');
+const { vaciarChat } = require('./mensajes');
 
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
@@ -127,6 +128,7 @@ router.get('/:id/equipo', async (req, res) => {
               COALESCE(u.nombre, i.nombre_invitado) AS nombre,
               COALESCE(u.celular, i.celular_invitado) AS celular,
               a.id AS area_id, a.nombre AS area_nombre,
+              pe.pausado,
               CASE WHEN pe.usuario_id IS NOT NULL THEN 'vinculado' ELSE 'pendiente' END AS estado
        FROM proyecto_equipo pe
        LEFT JOIN usuarios u ON u.id = pe.usuario_id
@@ -143,7 +145,76 @@ router.get('/:id/equipo', async (req, res) => {
   }
 });
 
+// ⏸️ PAUSAR / REANUDAR el acceso de una persona a este proyecto, sin desasignarla del todo.
+// Alterna el valor actual (si estaba pausada, la reanuda; si estaba activa, la pausa) — así el
+// mismo botón sirve para ambas acciones desde el frontend, sin tener que mandar el nuevo estado.
+// Mientras está pausada, GET /asignaciones/:usuario_id no la incluye, así que la persona pierde
+// acceso real a este proyecto (no puede verlo ni entrar), pero el historial de chat que ya
+// tuvieron queda intacto para cuando se reanude.
+router.put('/equipo/:asignacion_id/pausar', async (req, res) => {
+  try {
+    const { asignacion_id } = req.params;
+    const result = await pool.query(
+      'UPDATE proyecto_equipo SET pausado = NOT pausado WHERE id = $1 RETURNING *',
+      [asignacion_id]
+    );
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Asignación no encontrada' });
+    }
+    const asignacion = result.rows[0];
+    res.json({
+      mensaje: asignacion.pausado ? 'Asignación pausada' : 'Asignación reanudada',
+      asignacion,
+    });
+  } catch (error) {
+    console.error('Error pausando/reanudando asignación:', error);
+    res.status(500).json({ error: 'Error al pausar/reanudar la asignación' });
+  }
+});
+
+// 🗑️ ELIMINAR a una persona de un proyecto por completo (quita la fila de proyecto_equipo, y
+// además vacía el chat que tuvieron en esa área — confirmado con el usuario que ambas cosas
+// deben borrarse juntas, para no dejar un chat "huérfano" con alguien que ya no tiene acceso).
+// Solo aplica a personal ya vinculado (usuario_id no nulo); si la asignación era de alguien
+// pendiente (invitación sin aceptar), no hay chat que vaciar.
+router.delete('/equipo/:asignacion_id', async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const { asignacion_id } = req.params;
+    const { usuario_solicitante_id } = req.body; // quién de gerencia hace la petición (dueño del chat con esta persona)
+
+    const asignacionResult = await client.query('SELECT * FROM proyecto_equipo WHERE id = $1', [asignacion_id]);
+    if (asignacionResult.rows.length === 0) {
+      return res.status(404).json({ error: 'Asignación no encontrada' });
+    }
+    const asignacion = asignacionResult.rows[0];
+
+    await client.query('BEGIN');
+
+    // El chat es 1 a 1 (usuario_id ↔ destinatario_usuario_id), así que se vacía específicamente
+    // el hilo entre la persona eliminada y quien hizo la petición — solo si ambos ids existen
+    // (la persona ya estaba vinculada, y sabemos quién es el otro lado de esa conversación).
+    if (asignacion.usuario_id && usuario_solicitante_id) {
+      await vaciarChat(client, asignacion.proyecto_id, asignacion.area_id, asignacion.usuario_id, usuario_solicitante_id);
+    }
+
+    await client.query('DELETE FROM proyecto_equipo WHERE id = $1', [asignacion_id]);
+
+    await client.query('COMMIT');
+    res.json({ mensaje: 'Persona eliminada del proyecto exitosamente' });
+  } catch (error) {
+    await client.query('ROLLBACK');
+    console.error('Error eliminando asignación:', error);
+    res.status(500).json({ error: 'Error al eliminar la persona del proyecto' });
+  } finally {
+    client.release();
+  }
+});
+
 // 👤 VER en qué proyectos y áreas está asignada una persona actualmente
+// pe.pausado = false: si gerencia pausó la asignación de esta persona a un proyecto, deja de
+// aparecer aquí — este es el bloqueo REAL de acceso (no solo visual), porque esta es la consulta
+// que usa la app para decidir qué proyectos puede ver/entrar un trabajador.
 router.get('/asignaciones/:usuario_id', async (req, res) => {
   try {
     const { usuario_id } = req.params;
@@ -152,7 +223,7 @@ router.get('/asignaciones/:usuario_id', async (req, res) => {
        FROM proyecto_equipo pe
        JOIN proyectos p ON p.id = pe.proyecto_id
        JOIN areas_catalogo a ON a.id = pe.area_id
-       WHERE pe.usuario_id = $1 AND p.estado = 'activo'
+       WHERE pe.usuario_id = $1 AND p.estado = 'activo' AND pe.pausado = false
        ORDER BY p.nombre`,
       [usuario_id]
     );
