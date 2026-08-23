@@ -9,12 +9,23 @@ const pool = new Pool({
   ssl: { rejectUnauthorized: false }
 });
 
+// Quita mayúsculas y acentos para poder comparar nombres sin importar cómo los haya escrito el
+// usuario (mismo criterio que "textoNormalizado" en el frontend, ej. GrupoTrabajoScreen.tsx).
+// Sin esto, alguien registrado como "José Pérez" que escriba "jose perez" en recuperar
+// contraseña (sin tildes, muy común al escribir rápido en el celular) fallaría la validación.
+const textoNormalizado = (t) => (t || '').toString().trim().toLowerCase().normalize('NFD').replace(/[̀-ͯ]/g, '');
+
 // Lista histórica de áreas administrativas. Ya no se usa para decidir si se pide contraseña:
 // ahora TODAS las áreas la requieren al aceptar una invitación (antes el personal de campo
 // entraba solo con el celular, sin contraseña).
 const AREAS_ADMINISTRATIVAS = ['GERENCIA', 'AREA ADMINISTRATIVA', 'AREA DE LOGISTICA'];
 
-// 📝 GENERAR invitación (agregar personal desde Grupo de Trabajo)
+// 📝 AGREGAR personal desde Grupo de Trabajo. Ya NO genera ningún link: solo deja la fila
+// "pendiente" en invitaciones (y su asignación en proyecto_equipo, si aplica) con el nombre y
+// celular de la persona. Esa persona entra por su cuenta desde "Ingresar como invitado" poniendo
+// su celular — la app descubre automáticamente a qué la asignaron (ver /verificar-celular y
+// /aceptar-por-celular más abajo). El contacto para avisarle que la agregaron se hace por fuera
+// de la app (llamada, WhatsApp manual, etc.), no con un link generado aquí.
 router.post('/generar', async (req, res) => {
   try {
     const { empresa_id, area_id, nombre_invitado, celular_invitado } = req.body;
@@ -28,17 +39,13 @@ router.post('/generar', async (req, res) => {
       [empresa_id, area_id, nombre_invitado, celular_invitado]
     );
 
-    const invitacion = result.rows[0];
-    const link = `frontendappmedv2://invitacion/${invitacion.token}`;
-
     res.status(201).json({
-      mensaje: 'Invitación generada exitosamente',
-      invitacion,
-      link_whatsapp: link
+      mensaje: 'Persona agregada exitosamente. Pídele que entre a la app con su número de celular en "Ingresar como invitado".',
+      invitacion: result.rows[0],
     });
   } catch (error) {
-    console.error('Error generando invitación:', error);
-    res.status(500).json({ error: 'Error al generar invitación' });
+    console.error('Error agregando persona:', error);
+    res.status(500).json({ error: 'Error al agregar persona' });
   }
 });
 
@@ -52,11 +59,16 @@ router.get('/verificar-celular/:celular', async (req, res) => {
     const { celular } = req.params;
 
     const usuarioExistente = await pool.query('SELECT id, contraseña_hash FROM usuarios WHERE celular = $1', [celular]);
-    if (usuarioExistente.rows.length > 0 && usuarioExistente.rows[0].contraseña_hash) {
-      // Ya tiene cuenta y contraseña: no es un invitado "nuevo", debe iniciar sesión normal.
-      return res.json({ tiene_invitacion_pendiente: false, ya_tiene_cuenta: true });
-    }
 
+    // IMPORTANTE: revisamos primero si hay una invitación pendiente nueva (a CUALQUIER empresa),
+    // ANTES de decidir por "ya tiene contraseña, use login normal". Antes se revisaba al revés:
+    // si el usuario ya tenía contraseña (por ejemplo porque ya trabaja en OTRA empresa), se
+    // asumía directo que debía usar el login normal — pero el login normal (/auth/login) solo
+    // busca en usuario_empresa_rol (vínculos ya ACEPTADOS), y una invitación nueva a una empresa
+    // distinta vive solo en la tabla invitaciones/proyecto_equipo hasta que se acepta acá. Con el
+    // orden viejo, alguien ya vinculado a la Empresa A que es invitado a la Empresa B nunca podía
+    // completar esa segunda invitación: siempre caía al login normal, que no la conocía, y
+    // terminaba con "Este usuario no pertenece a ninguna empresa activa".
     const invResult = await pool.query(
       `SELECT i.*, e.nombre AS empresa_nombre
        FROM invitaciones i
@@ -67,23 +79,30 @@ router.get('/verificar-celular/:celular', async (req, res) => {
       [celular]
     );
 
-    if (invResult.rows.length === 0) {
+    if (invResult.rows.length > 0) {
+      const invitacion = invResult.rows[0];
+      return res.json({
+        tiene_invitacion_pendiente: true,
+        ya_tiene_cuenta: usuarioExistente.rows.length > 0,
+        empresa_nombre: invitacion.empresa_nombre,
+        nombre_invitado: invitacion.nombre_invitado,
+      });
+    }
+
+    if (usuarioExistente.rows.length > 0 && usuarioExistente.rows[0].contraseña_hash) {
+      // Ya tiene cuenta y contraseña, y no tiene ninguna invitación nueva pendiente: debe iniciar
+      // sesión normal (ve las empresas a las que ya está vinculado de verdad).
+      return res.json({ tiene_invitacion_pendiente: false, ya_tiene_cuenta: true });
+    }
+
+    if (usuarioExistente.rows.length > 0) {
       // Usuario legacy: ya tiene cuenta (se vinculó antes de que la contraseña fuera obligatoria)
       // pero nunca creó contraseña, y no tiene ninguna invitación pendiente nueva. No es "nadie te
       // asignó" — ya pertenece a una empresa, solo le falta crear su contraseña por primera vez.
-      if (usuarioExistente.rows.length > 0) {
-        return res.json({ tiene_invitacion_pendiente: false, ya_tiene_cuenta: true, debe_crear_contraseña: true });
-      }
-      return res.json({ tiene_invitacion_pendiente: false, ya_tiene_cuenta: false });
+      return res.json({ tiene_invitacion_pendiente: false, ya_tiene_cuenta: true, debe_crear_contraseña: true });
     }
 
-    const invitacion = invResult.rows[0];
-    res.json({
-      tiene_invitacion_pendiente: true,
-      ya_tiene_cuenta: usuarioExistente.rows.length > 0,
-      empresa_nombre: invitacion.empresa_nombre,
-      nombre_invitado: invitacion.nombre_invitado,
-    });
+    return res.json({ tiene_invitacion_pendiente: false, ya_tiene_cuenta: false });
   } catch (error) {
     console.error('Error verificando celular para invitado:', error);
     res.status(500).json({ error: 'Error al verificar el celular' });
@@ -134,6 +153,18 @@ router.post('/aceptar-por-celular', async (req, res) => {
           [hash, usuario.id]
         );
         usuario = actualizado.rows[0];
+      } else {
+        // Ya tenía cuenta y contraseña de antes (por ejemplo, ya trabaja en otra empresa) y ahora
+        // está aceptando una invitación NUEVA a otra empresa distinta. La pantalla le pide
+        // "crear" una contraseña otra vez, pero como el usuario ya existe, esa contraseña debe
+        // coincidir con la que ya tiene — si no, validamos por seguridad: sin este chequeo,
+        // alguien podría escribir cualquier cosa pensando que "crea" una contraseña nueva, y en
+        // realidad entraría con la vieja sin darse cuenta de que no coincide.
+        const coincide = await bcrypt.compare(contraseña, usuario.contraseña_hash);
+        if (!coincide) {
+          await client.query('ROLLBACK');
+          return res.status(401).json({ error: 'Ya tienes una cuenta con este número. Escribe tu contraseña actual (la misma que usas para tus otras empresas).' });
+        }
       }
     } else {
       const contraseñaHash = await bcrypt.hash(contraseña, 10);
@@ -185,157 +216,39 @@ router.post('/aceptar-por-celular', async (req, res) => {
   }
 });
 
-// 👁️ VER detalle de una invitación (sin consumirla) - útil para la app antes de aceptar
-router.get('/:token', async (req, res) => {
+// 🔑 RECUPERAR CONTRASEÑA: sin SMS ni servicios externos. Valida identidad pidiendo el celular +
+// el nombre exacto con el que esa persona quedó registrada en la base de datos (el mismo que
+// aparece en Grupo de Trabajo), y si coincide, le permite crear una contraseña nueva que
+// reemplaza a la anterior. Menos seguro que un código por SMS, pero no depende de contratar un
+// proveedor externo ni tiene costo por mensaje.
+router.post('/recuperar-contraseña', async (req, res) => {
   try {
-    const { token } = req.params;
-    const result = await pool.query(
-      `SELECT i.*, e.nombre AS empresa_nombre, e.logo_url, e.color_hex, a.nombre AS area_nombre, a.tipo AS area_tipo
-       FROM invitaciones i
-       JOIN empresas e ON e.id = i.empresa_id
-       JOIN areas_catalogo a ON a.id = i.area_id
-       WHERE i.token = $1`,
-      [token]
-    );
-
-    if (result.rows.length === 0) {
-      return res.status(404).json({ error: 'Invitación no encontrada' });
+    const { celular, nombre, contraseña_nueva } = req.body;
+    if (!celular || !nombre || !contraseña_nueva) {
+      return res.status(400).json({ error: 'celular, nombre y contraseña_nueva son obligatorios' });
+    }
+    if (contraseña_nueva.length < 6) {
+      return res.status(400).json({ error: 'La nueva contraseña debe tener al menos 6 caracteres' });
     }
 
-    res.json(result.rows[0]);
+    const usuarioResult = await pool.query('SELECT * FROM usuarios WHERE celular = $1', [celular]);
+    if (usuarioResult.rows.length === 0) {
+      return res.status(404).json({ error: 'No existe ningún usuario con este número de celular' });
+    }
+    const usuario = usuarioResult.rows[0];
+
+    const nombreCoincide = textoNormalizado(usuario.nombre) === textoNormalizado(nombre);
+    if (!nombreCoincide) {
+      return res.status(401).json({ error: 'El nombre no coincide con el registrado para este celular. Verifica que esté escrito igual que en Grupo de Trabajo.' });
+    }
+
+    const hash = await bcrypt.hash(contraseña_nueva, 10);
+    await pool.query('UPDATE usuarios SET contraseña_hash = $1 WHERE id = $2', [hash, usuario.id]);
+
+    res.json({ mensaje: 'Contraseña actualizada exitosamente. Ya puedes ingresar con tu contraseña nueva.' });
   } catch (error) {
-    console.error('Error obteniendo invitación:', error);
-    res.status(500).json({ error: 'Error al obtener invitación' });
-  }
-});
-
-// 👁️ VER el link de una invitación existente por su id (para reenviarla desde Grupo de Trabajo
-// cuando una persona sigue "pendiente" y quizás no se le reenvió el link a tiempo)
-router.get('/id/:id/link', async (req, res) => {
-  try {
-    const { id } = req.params;
-    const result = await pool.query(
-      `SELECT i.*, a.nombre AS area_nombre
-       FROM invitaciones i
-       JOIN areas_catalogo a ON a.id = i.area_id
-       WHERE i.id = $1`,
-      [id]
-    );
-
-    if (result.rows.length === 0) {
-      return res.status(404).json({ error: 'Invitación no encontrada' });
-    }
-
-    const invitacion = result.rows[0];
-    if (invitacion.usado) {
-      return res.status(400).json({ error: 'Esta invitación ya fue aceptada' });
-    }
-
-    const link = `frontendappmedv2://invitacion/${invitacion.token}`;
-    res.json({ invitacion, link_whatsapp: link });
-  } catch (error) {
-    console.error('Error obteniendo link de invitación:', error);
-    res.status(500).json({ error: 'Error al obtener el link de invitación' });
-  }
-});
-
-// ✅ ACEPTAR invitación (vincula al usuario con la empresa y área)
-router.post('/aceptar/:token', async (req, res) => {
-  const client = await pool.connect();
-  try {
-    const { token } = req.params;
-    const { contraseña } = req.body;
-
-    const invResult = await client.query(
-      `SELECT i.*, a.nombre AS area_nombre
-       FROM invitaciones i
-       JOIN areas_catalogo a ON a.id = i.area_id
-       WHERE i.token = $1`,
-      [token]
-    );
-    if (invResult.rows.length === 0) {
-      return res.status(404).json({ error: 'Invitación no encontrada' });
-    }
-
-    const invitacion = invResult.rows[0];
-    if (invitacion.usado) {
-      return res.status(400).json({ error: 'Esta invitación ya fue utilizada' });
-    }
-
-    // Todas las áreas requieren contraseña al aceptar la invitación (antes solo las administrativas).
-    if (!contraseña || contraseña.length < 6) {
-      return res.status(400).json({ error: 'Debes crear una contraseña de al menos 6 caracteres' });
-    }
-
-    await client.query('BEGIN');
-
-    let usuarioResult = await client.query('SELECT * FROM usuarios WHERE celular = $1', [invitacion.celular_invitado]);
-    let usuario;
-
-    if (usuarioResult.rows.length > 0) {
-      usuario = usuarioResult.rows[0];
-      if (!usuario.contraseña_hash) {
-        const hash = await bcrypt.hash(contraseña, 10);
-        const actualizado = await client.query(
-          'UPDATE usuarios SET contraseña_hash = $1 WHERE id = $2 RETURNING *',
-          [hash, usuario.id]
-        );
-        usuario = actualizado.rows[0];
-      }
-    } else {
-      const contraseñaHash = await bcrypt.hash(contraseña, 10);
-      const nuevoUsuario = await client.query(
-        'INSERT INTO usuarios (celular, nombre, contraseña_hash) VALUES ($1, $2, $3) RETURNING *',
-        [invitacion.celular_invitado, invitacion.nombre_invitado, contraseñaHash]
-      );
-      usuario = nuevoUsuario.rows[0];
-    }
-
-    await client.query(
-      'INSERT INTO usuario_empresa_rol (usuario_id, empresa_id, area_id, estado) VALUES ($1, $2, $3, $4)',
-      [usuario.id, invitacion.empresa_id, invitacion.area_id, 'activo']
-    );
-
-    // Si esta persona ya había sido asignada a algún proyecto mientras estaba "pendiente"
-    // (proyecto_equipo.invitacion_id), ahora que tiene usuario real esas filas se completan con
-    // su usuario_id, para que dejen de figurar como pendientes en el equipo del proyecto.
-    await client.query(
-      'UPDATE proyecto_equipo SET usuario_id = $1, invitacion_id = NULL WHERE invitacion_id = $2',
-      [usuario.id, invitacion.id]
-    );
-
-    await client.query('UPDATE invitaciones SET usado = TRUE WHERE token = $1', [token]);
-
-    await client.query('COMMIT');
-
-    delete usuario.contraseña_hash;
-
-    // Traemos TODAS las empresas/áreas activas de este usuario (puede que ya perteneciera a
-    // otras antes de esta invitación), con el mismo formato que devuelve /auth/login — así el
-    // frontend puede guardar la sesión y entrar directo a la app, sin tener que loguearse de
-    // nuevo con celular/contraseña justo después de haber creado la contraseña.
-    const rolesResult = await client.query(
-      `SELECT uer.empresa_id, e.nombre AS empresa_nombre, e.logo_url, e.color_hex, e.sitio_web,
-              e.nit, e.cedula_representante, e.banco_nombre, e.banco_tipo_cuenta, e.banco_numero, e.banco_titular,
-              a.id AS area_id, a.nombre AS area_nombre, a.tipo AS area_tipo
-       FROM usuario_empresa_rol uer
-       JOIN empresas e ON e.id = uer.empresa_id
-       JOIN areas_catalogo a ON a.id = uer.area_id
-       WHERE uer.usuario_id = $1 AND uer.estado = 'activo' AND e.estado = 'activo'`,
-      [usuario.id]
-    );
-
-    res.json({
-      mensaje: 'Invitación aceptada, usuario vinculado exitosamente',
-      usuario,
-      empresas: rolesResult.rows,
-    });
-  } catch (error) {
-    await client.query('ROLLBACK');
-    console.error('Error aceptando invitación:', error);
-    res.status(500).json({ error: 'Error al aceptar invitación' });
-  } finally {
-    client.release();
+    console.error('Error recuperando contraseña:', error);
+    res.status(500).json({ error: 'No se pudo actualizar la contraseña. Intenta de nuevo.' });
   }
 });
 

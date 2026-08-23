@@ -207,8 +207,10 @@ router.post('/:id/invitar', async (req, res) => {
 
     await client.query('COMMIT');
 
-    const link = `frontendappmedv2://invitacion/${invitacion.token}`;
-    res.status(201).json({ mensaje: 'Invitación generada exitosamente', invitacion, link_whatsapp: link });
+    res.status(201).json({
+      mensaje: 'Invitación generada exitosamente. Pídele al cliente que entre a la app con su celular en "Ingresar como invitado".',
+      invitacion,
+    });
   } catch (error) {
     await client.query('ROLLBACK');
     console.error('Error invitando cliente:', error);
