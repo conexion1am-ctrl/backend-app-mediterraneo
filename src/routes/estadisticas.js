@@ -2,11 +2,63 @@ const express = require('express');
 const { Pool } = require('pg');
 const router = express.Router();
 require('dotenv').config();
+const { generarExcelFinancieroBuffer } = require('../utils/generarExcelFinanciero');
+const { subirBufferAStorage, borrarArchivoDeStorage } = require('../utils/firebaseAdmin');
 
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: { rejectUnauthorized: false }
 });
+
+// Arma el mismo objeto de estadísticas que devuelve GET /:proyecto_id, pero como función
+// reutilizable (la usa también el endpoint de Excel, para no duplicar las 4 consultas).
+async function obtenerEstadisticasProyecto(proyecto_id) {
+  const statsResult = await pool.query('SELECT * FROM estadisticas_proyecto WHERE proyecto_id = $1', [proyecto_id]);
+  if (statsResult.rows.length === 0) return null;
+  const stats = statsResult.rows[0];
+
+  const abonosResult = await pool.query(
+    'SELECT * FROM abonos_proyecto WHERE proyecto_id = $1 ORDER BY fecha DESC',
+    [proyecto_id]
+  );
+
+  const movimientosResult = await pool.query(
+    `SELECT m.*, c.nombre AS categoria_nombre
+     FROM movimientos_costos m
+     LEFT JOIN categorias_costo c ON c.id = m.categoria_id
+     WHERE m.proyecto_id = $1
+     ORDER BY m.fecha DESC, m.created_at DESC`,
+    [proyecto_id]
+  );
+
+  const resumenPorCategoriaResult = await pool.query(
+    `SELECT c.id AS categoria_id, c.nombre AS categoria_nombre,
+            COALESCE(SUM(m.valor) FILTER (WHERE m.tipo = 'materiales'), 0) AS total_materiales,
+            COALESCE(SUM(m.valor) FILTER (WHERE m.tipo = 'mano_obra'), 0) AS total_mano_obra,
+            COALESCE(SUM(m.valor) FILTER (WHERE m.tipo = 'imprevistos'), 0) AS total_imprevistos,
+            COALESCE(SUM(m.valor), 0) AS total
+     FROM movimientos_costos m
+     JOIN categorias_costo c ON c.id = m.categoria_id
+     WHERE m.proyecto_id = $1
+     GROUP BY c.id, c.nombre
+     ORDER BY total DESC`,
+    [proyecto_id]
+  );
+
+  const totalAbonado = abonosResult.rows.reduce((sum, a) => sum + parseFloat(a.valor), 0);
+  const costos = parseFloat(stats.costos_materiales) + parseFloat(stats.valor_mano_obra) + parseFloat(stats.valor_imprevistos);
+  const utilidad = parseFloat(stats.valor_contrato) - costos;
+
+  return {
+    ...stats,
+    abonos: abonosResult.rows,
+    movimientos_costos: movimientosResult.rows,
+    resumen_por_categoria: resumenPorCategoriaResult.rows,
+    total_abonado: totalAbonado,
+    saldo_pendiente: parseFloat(stats.valor_contrato) - totalAbonado,
+    utilidad,
+  };
+}
 
 // 👁️ VER estadísticas de un proyecto (incluye utilidad calculada, el historial de movimientos
 // de costos agrupado por tipo: materiales, mano_obra, imprevistos, y un resumen por CATEGORÍA
@@ -15,63 +67,69 @@ const pool = new Pool({
 router.get('/:proyecto_id', async (req, res) => {
   try {
     const { proyecto_id } = req.params;
-
-    const statsResult = await pool.query('SELECT * FROM estadisticas_proyecto WHERE proyecto_id = $1', [proyecto_id]);
-    if (statsResult.rows.length === 0) {
+    const stats = await obtenerEstadisticasProyecto(proyecto_id);
+    if (!stats) {
       return res.status(404).json({ error: 'No hay estadísticas para este proyecto todavía' });
     }
-    const stats = statsResult.rows[0];
-
-    const abonosResult = await pool.query(
-      'SELECT * FROM abonos_proyecto WHERE proyecto_id = $1 ORDER BY fecha DESC',
-      [proyecto_id]
-    );
-
-    // Traemos cada movimiento con el nombre de su categoría ya resuelto (si tiene una), para que
-    // el frontend no tenga que cruzar listas por separado.
-    const movimientosResult = await pool.query(
-      `SELECT m.*, c.nombre AS categoria_nombre
-       FROM movimientos_costos m
-       LEFT JOIN categorias_costo c ON c.id = m.categoria_id
-       WHERE m.proyecto_id = $1
-       ORDER BY m.fecha DESC, m.created_at DESC`,
-      [proyecto_id]
-    );
-
-    // Resumen por categoría: cuánto se lleva gastado en cada rubro (sumando materiales + mano de
-    // obra + imprevistos juntos), para responder "cuánto me costó realmente el estuco". Los
-    // movimientos sin categoría no entran aquí (se ven igual en el historial, solo sin agrupar).
-    const resumenPorCategoriaResult = await pool.query(
-      `SELECT c.id AS categoria_id, c.nombre AS categoria_nombre,
-              COALESCE(SUM(m.valor) FILTER (WHERE m.tipo = 'materiales'), 0) AS total_materiales,
-              COALESCE(SUM(m.valor) FILTER (WHERE m.tipo = 'mano_obra'), 0) AS total_mano_obra,
-              COALESCE(SUM(m.valor) FILTER (WHERE m.tipo = 'imprevistos'), 0) AS total_imprevistos,
-              COALESCE(SUM(m.valor), 0) AS total
-       FROM movimientos_costos m
-       JOIN categorias_costo c ON c.id = m.categoria_id
-       WHERE m.proyecto_id = $1
-       GROUP BY c.id, c.nombre
-       ORDER BY total DESC`,
-      [proyecto_id]
-    );
-
-    const totalAbonado = abonosResult.rows.reduce((sum, a) => sum + parseFloat(a.valor), 0);
-
-    const costos = parseFloat(stats.costos_materiales) + parseFloat(stats.valor_mano_obra) + parseFloat(stats.valor_imprevistos);
-    const utilidad = parseFloat(stats.valor_contrato) - costos;
-
-    res.json({
-      ...stats,
-      abonos: abonosResult.rows,
-      movimientos_costos: movimientosResult.rows,
-      resumen_por_categoria: resumenPorCategoriaResult.rows,
-      total_abonado: totalAbonado,
-      saldo_pendiente: parseFloat(stats.valor_contrato) - totalAbonado,
-      utilidad
-    });
+    res.json(stats);
   } catch (error) {
     console.error('Error obteniendo estadísticas:', error);
     res.status(500).json({ error: 'Error al obtener estadísticas' });
+  }
+});
+
+// 📊 GENERAR Y DESCARGAR el estado financiero del proyecto en Excel (.xlsx): resumen, costos por
+// categoría, historial de movimientos y de abonos. Se genera al momento (no se guarda en la base
+// de datos ni en Storage, a diferencia del PDF de cotización/contrato) porque cambia cada vez que
+// se registra un nuevo costo o abono — no tendría sentido cachear una versión vieja.
+router.get('/:proyecto_id/excel', async (req, res) => {
+  try {
+    const { proyecto_id } = req.params;
+    const stats = await obtenerEstadisticasProyecto(proyecto_id);
+    if (!stats) {
+      return res.status(404).json({ error: 'No hay estadísticas para este proyecto todavía' });
+    }
+
+    const proyectoResult = await pool.query(
+      `SELECT p.nombre AS proyecto_nombre, e.nombre AS empresa_nombre
+       FROM proyectos p
+       JOIN empresas e ON e.id = p.empresa_id
+       WHERE p.id = $1`,
+      [proyecto_id]
+    );
+    if (proyectoResult.rows.length === 0) {
+      return res.status(404).json({ error: 'Proyecto no encontrado' });
+    }
+    const { proyecto_nombre, empresa_nombre } = proyectoResult.rows[0];
+
+    const buffer = await generarExcelFinancieroBuffer({
+      proyectoNombre: proyecto_nombre,
+      empresaNombre: empresa_nombre,
+      stats,
+    });
+
+    const rutaDestino = `estados_financieros/proyecto_${proyecto_id}_${Date.now()}.xlsx`;
+    const url = await subirBufferAStorage(
+      buffer,
+      rutaDestino,
+      'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+    );
+
+    // Este Excel no se guarda de forma permanente (a diferencia de los PDF de cotización/
+    // contrato): se genera al vuelo cada vez porque los datos cambian con cada costo o abono
+    // nuevo. Para no acumular archivos huérfanos en Storage para siempre, lo borramos 10 minutos
+    // después de servirlo — tiempo de sobra para que el celular termine de descargarlo desde la
+    // URL antes de que se elimine.
+    setTimeout(() => {
+      borrarArchivoDeStorage(url).catch(() => {});
+    }, 10 * 60 * 1000);
+
+    res.json({ mensaje: 'Estado financiero generado exitosamente', url });
+  } catch (error) {
+    // Errores esperables: Firebase Admin sin configurar (no debería pasar en producción, pero
+    // así el mensaje explica la causa real en vez de un genérico "Error interno").
+    console.error('Error generando Excel de estado financiero:', error.message, error.stack);
+    res.status(500).json({ error: 'No se pudo generar el estado financiero. Intenta de nuevo en unos minutos.' });
   }
 });
 
