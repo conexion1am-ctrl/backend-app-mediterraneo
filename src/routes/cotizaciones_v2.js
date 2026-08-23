@@ -233,6 +233,13 @@ router.post('/contratos/:id/crear-proyecto', async (req, res) => {
     if (contrato.cotizacion_id) {
       await client.query('UPDATE cotizaciones SET proyecto_id = $1 WHERE id = $2', [proyecto.id, contrato.cotizacion_id]);
     }
+    // Enlaza también el registro del cliente (pantalla Clientes) con el proyecto recién creado.
+    // Sin esto, clientes.proyecto_id se queda en NULL para siempre — y como el botón "Invitar a
+    // su proyecto" de ClientesScreen depende de ese campo para saber a qué proyecto asignar al
+    // cliente, quedaría inutilizable en la práctica (siempre diría "no tiene proyecto").
+    if (cliente) {
+      await client.query('UPDATE clientes SET proyecto_id = $1 WHERE id = $2', [proyecto.id, cliente.id]);
+    }
 
     const estadisticasExistentes = await client.query('SELECT id FROM estadisticas_proyecto WHERE proyecto_id = $1', [proyecto.id]);
     if (estadisticasExistentes.rows.length === 0) {

@@ -137,6 +137,87 @@ router.delete('/:id', async (req, res) => {
   }
 });
 
+// 📩 INVITAR a un cliente a su proyecto: genera una invitación al "AREA DE CLIENTES" usando el
+// nombre y celular que YA tiene guardados en su ficha (sin volver a escribirlos en Grupo de
+// Trabajo, que antes duplicaba el registro del cliente con riesgo de que el celular quedara
+// distinto entre los dos lugares). Deja además la asignación "provisional" en proyecto_equipo de
+// una sola vez (mismo mecanismo que usa Asignar Personal en un proyecto), para que el cliente
+// quede vinculado a SU proyecto desde el primer momento en que acepte el link.
+router.post('/:id/invitar', async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const { id } = req.params;
+
+    const clienteResult = await client.query('SELECT * FROM clientes WHERE id = $1', [id]);
+    if (clienteResult.rows.length === 0) {
+      return res.status(404).json({ error: 'Cliente no encontrado' });
+    }
+    const cliente = clienteResult.rows[0];
+
+    if (!cliente.celular) {
+      return res.status(400).json({ error: 'Este cliente no tiene celular guardado. Agrégaselo editando su ficha antes de invitarlo.' });
+    }
+
+    // clientes.proyecto_id se llena automáticamente al crear el proyecto desde un contrato (ver
+    // POST /contratos/:id/crear-proyecto en cotizaciones_v2.js). Para clientes que ya tenían un
+    // proyecto creado ANTES de que ese enlace existiera, hacemos un respaldo buscando el
+    // proyecto por el camino cliente → cotización → proyecto, sin depender de esa columna.
+    let proyectoId = cliente.proyecto_id;
+    if (!proyectoId) {
+      const viaCotizacion = await client.query(
+        `SELECT proyecto_id FROM cotizaciones WHERE cliente_id = $1 AND proyecto_id IS NOT NULL ORDER BY created_at DESC LIMIT 1`,
+        [id]
+      );
+      proyectoId = viaCotizacion.rows[0]?.proyecto_id || null;
+    }
+    if (!proyectoId) {
+      return res.status(400).json({ error: 'Este cliente todavía no tiene un proyecto creado. Acepta su cotización o crea el proyecto primero.' });
+    }
+
+    const areaResult = await client.query("SELECT id FROM areas_catalogo WHERE nombre = 'AREA DE CLIENTES'");
+    if (areaResult.rows.length === 0) {
+      return res.status(500).json({ error: 'No se encontró el área de clientes en el catálogo. Contacta soporte.' });
+    }
+    const areaId = areaResult.rows[0].id;
+
+    // Evita generar una segunda invitación si el cliente ya tiene una pendiente a este mismo
+    // proyecto (por ejemplo si gerencia toca "Invitar" dos veces sin querer).
+    const yaInvitado = await client.query(
+      `SELECT i.id FROM proyecto_equipo pe
+       JOIN invitaciones i ON i.id = pe.invitacion_id
+       WHERE pe.proyecto_id = $1 AND pe.area_id = $2 AND i.celular_invitado = $3 AND i.usado = FALSE`,
+      [proyectoId, areaId, cliente.celular]
+    );
+    if (yaInvitado.rows.length > 0) {
+      return res.status(400).json({ error: 'Este cliente ya tiene una invitación pendiente a este proyecto.' });
+    }
+
+    await client.query('BEGIN');
+
+    const invResult = await client.query(
+      'INSERT INTO invitaciones (empresa_id, area_id, nombre_invitado, celular_invitado) VALUES ($1, $2, $3, $4) RETURNING *',
+      [cliente.empresa_id, areaId, cliente.nombre, cliente.celular]
+    );
+    const invitacion = invResult.rows[0];
+
+    await client.query(
+      'INSERT INTO proyecto_equipo (proyecto_id, invitacion_id, area_id) VALUES ($1, $2, $3)',
+      [proyectoId, invitacion.id, areaId]
+    );
+
+    await client.query('COMMIT');
+
+    const link = `frontendappmedv2://invitacion/${invitacion.token}`;
+    res.status(201).json({ mensaje: 'Invitación generada exitosamente', invitacion, link_whatsapp: link });
+  } catch (error) {
+    await client.query('ROLLBACK');
+    console.error('Error invitando cliente:', error);
+    res.status(500).json({ error: 'No se pudo invitar al cliente. Intenta de nuevo.' });
+  } finally {
+    client.release();
+  }
+});
+
 // 👁️ LISTAR clientes de una empresa
 router.get('/listar/:empresa_id', async (req, res) => {
   try {
