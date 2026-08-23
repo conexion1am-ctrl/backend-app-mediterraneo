@@ -42,6 +42,149 @@ router.post('/generar', async (req, res) => {
   }
 });
 
+// 🔍 VERIFICAR si un celular tiene una invitación pendiente (sin importar la empresa) - usado por
+// la pantalla "Ingresar como trabajador", donde el usuario no elige empresa: la app la descubre
+// a partir de su celular. Si ya tiene cuenta con contraseña, le decimos que use el login normal.
+// NOTA: debe ir ANTES de "GET /:token" (más abajo), porque esa ruta genérica capturaría
+// "/verificar-celular/..." como si fuera un token cualquiera si quedara declarada primero.
+router.get('/verificar-celular/:celular', async (req, res) => {
+  try {
+    const { celular } = req.params;
+
+    const usuarioExistente = await pool.query('SELECT id, contraseña_hash FROM usuarios WHERE celular = $1', [celular]);
+    if (usuarioExistente.rows.length > 0 && usuarioExistente.rows[0].contraseña_hash) {
+      // Ya tiene cuenta y contraseña: no es un invitado "nuevo", debe iniciar sesión normal.
+      return res.json({ tiene_invitacion_pendiente: false, ya_tiene_cuenta: true });
+    }
+
+    const invResult = await pool.query(
+      `SELECT i.*, e.nombre AS empresa_nombre
+       FROM invitaciones i
+       JOIN empresas e ON e.id = i.empresa_id
+       WHERE i.celular_invitado = $1 AND i.usado = FALSE
+       ORDER BY i.created_at DESC
+       LIMIT 1`,
+      [celular]
+    );
+
+    if (invResult.rows.length === 0) {
+      // Usuario legacy: ya tiene cuenta (se vinculó antes de que la contraseña fuera obligatoria)
+      // pero nunca creó contraseña, y no tiene ninguna invitación pendiente nueva. No es "nadie te
+      // asignó" — ya pertenece a una empresa, solo le falta crear su contraseña por primera vez.
+      if (usuarioExistente.rows.length > 0) {
+        return res.json({ tiene_invitacion_pendiente: false, ya_tiene_cuenta: true, debe_crear_contraseña: true });
+      }
+      return res.json({ tiene_invitacion_pendiente: false, ya_tiene_cuenta: false });
+    }
+
+    const invitacion = invResult.rows[0];
+    res.json({
+      tiene_invitacion_pendiente: true,
+      ya_tiene_cuenta: usuarioExistente.rows.length > 0,
+      empresa_nombre: invitacion.empresa_nombre,
+      nombre_invitado: invitacion.nombre_invitado,
+    });
+  } catch (error) {
+    console.error('Error verificando celular para invitado:', error);
+    res.status(500).json({ error: 'Error al verificar el celular' });
+  }
+});
+
+// ✅ ACEPTAR invitación pendiente identificando al usuario por su celular (en vez de por un token
+// de link). Reutiliza la misma lógica que /aceptar/:token: crea o actualiza el usuario con
+// contraseña, lo vincula a la empresa/área, y completa cualquier proyecto_equipo pendiente.
+router.post('/aceptar-por-celular', async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const { celular, contraseña } = req.body;
+    if (!celular) {
+      return res.status(400).json({ error: 'celular es obligatorio' });
+    }
+    if (!contraseña || contraseña.length < 6) {
+      return res.status(400).json({ error: 'Debes crear una contraseña de al menos 6 caracteres' });
+    }
+
+    const invResult = await client.query(
+      `SELECT i.*, a.nombre AS area_nombre
+       FROM invitaciones i
+       JOIN areas_catalogo a ON a.id = i.area_id
+       WHERE i.celular_invitado = $1 AND i.usado = FALSE
+       ORDER BY i.created_at DESC
+       LIMIT 1`,
+      [celular]
+    );
+
+    if (invResult.rows.length === 0) {
+      return res.status(404).json({ error: 'No tienes ninguna invitación pendiente con este número' });
+    }
+
+    const invitacion = invResult.rows[0];
+
+    await client.query('BEGIN');
+
+    let usuarioResult = await client.query('SELECT * FROM usuarios WHERE celular = $1', [invitacion.celular_invitado]);
+    let usuario;
+
+    if (usuarioResult.rows.length > 0) {
+      usuario = usuarioResult.rows[0];
+      if (!usuario.contraseña_hash) {
+        const hash = await bcrypt.hash(contraseña, 10);
+        const actualizado = await client.query(
+          'UPDATE usuarios SET contraseña_hash = $1 WHERE id = $2 RETURNING *',
+          [hash, usuario.id]
+        );
+        usuario = actualizado.rows[0];
+      }
+    } else {
+      const contraseñaHash = await bcrypt.hash(contraseña, 10);
+      const nuevoUsuario = await client.query(
+        'INSERT INTO usuarios (celular, nombre, contraseña_hash) VALUES ($1, $2, $3) RETURNING *',
+        [invitacion.celular_invitado, invitacion.nombre_invitado, contraseñaHash]
+      );
+      usuario = nuevoUsuario.rows[0];
+    }
+
+    await client.query(
+      'INSERT INTO usuario_empresa_rol (usuario_id, empresa_id, area_id, estado) VALUES ($1, $2, $3, $4)',
+      [usuario.id, invitacion.empresa_id, invitacion.area_id, 'activo']
+    );
+
+    await client.query(
+      'UPDATE proyecto_equipo SET usuario_id = $1, invitacion_id = NULL WHERE invitacion_id = $2',
+      [usuario.id, invitacion.id]
+    );
+
+    await client.query('UPDATE invitaciones SET usado = TRUE WHERE id = $1', [invitacion.id]);
+
+    await client.query('COMMIT');
+
+    delete usuario.contraseña_hash;
+
+    const rolesResult = await client.query(
+      `SELECT uer.empresa_id, e.nombre AS empresa_nombre, e.logo_url, e.color_hex, e.sitio_web,
+              e.nit, e.cedula_representante, e.banco_nombre, e.banco_tipo_cuenta, e.banco_numero, e.banco_titular,
+              a.id AS area_id, a.nombre AS area_nombre, a.tipo AS area_tipo
+       FROM usuario_empresa_rol uer
+       JOIN empresas e ON e.id = uer.empresa_id
+       JOIN areas_catalogo a ON a.id = uer.area_id
+       WHERE uer.usuario_id = $1 AND uer.estado = 'activo' AND e.estado = 'activo'`,
+      [usuario.id]
+    );
+
+    res.json({
+      mensaje: 'Invitación aceptada, usuario vinculado exitosamente',
+      usuario,
+      empresas: rolesResult.rows,
+    });
+  } catch (error) {
+    await client.query('ROLLBACK');
+    console.error('Error aceptando invitación por celular:', error);
+    res.status(500).json({ error: 'Error al aceptar la invitación' });
+  } finally {
+    client.release();
+  }
+});
+
 // 👁️ VER detalle de una invitación (sin consumirla) - útil para la app antes de aceptar
 router.get('/:token', async (req, res) => {
   try {
