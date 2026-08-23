@@ -110,6 +110,107 @@ async function aplicarMigraciones() {
     // desde cero (conserva el historial del chat que ya tenían).
     await pool.query(`ALTER TABLE proyecto_equipo ADD COLUMN IF NOT EXISTS pausado BOOLEAN NOT NULL DEFAULT false`);
 
+    // remitente_nombre_snapshot en mensajes: guarda el nombre de quien envió, como respaldo para
+    // cuando esa persona sea eliminada por completo de la plataforma (ver DELETE
+    // /api/areas/personal/:usuario_id/total en areas.js). Sin esto, el chat de la OTRA persona en
+    // la conversación se rompería: el SELECT de mensajes.js usa JOIN usuarios para mostrar el
+    // nombre, y si la fila usuarios desaparece, esos mensajes dejarían de listarse por completo
+    // (INNER JOIN los excluye). Con el snapshot, el historial se conserva intacto mostrando el
+    // nombre tal como era al momento del borrado, aunque la cuenta ya no exista.
+    await pool.query(`ALTER TABLE mensajes ADD COLUMN IF NOT EXISTS remitente_nombre_snapshot VARCHAR(255)`);
+
+    // usuario_id NULLABLE con ON DELETE SET NULL en fotos_avance y planos_3d: si se elimina a
+    // alguien de la plataforma por completo, sus fotos de avance y planos 3D de proyectos
+    // anteriores se CONSERVAN (son evidencia de obra que la empresa quiere conservar) — solo se
+    // pierde la referencia de quién los subió. Buscamos el nombre REAL de la constraint FK
+    // existente (Postgres lo autogenera y puede no ser el que asumiríamos por convención) antes
+    // de reemplazarla, en vez de adivinar el nombre — así funciona sin importar cómo se llame.
+    await pool.query(`ALTER TABLE fotos_avance ALTER COLUMN usuario_id DROP NOT NULL`);
+    await pool.query(`
+      DO $$
+      DECLARE nombre_fk TEXT;
+      BEGIN
+        SELECT tc.constraint_name INTO nombre_fk
+        FROM information_schema.table_constraints tc
+        JOIN information_schema.key_column_usage kcu ON kcu.constraint_name = tc.constraint_name
+        WHERE tc.table_name = 'fotos_avance' AND tc.constraint_type = 'FOREIGN KEY' AND kcu.column_name = 'usuario_id'
+        LIMIT 1;
+
+        IF nombre_fk IS NOT NULL THEN
+          EXECUTE format('ALTER TABLE fotos_avance DROP CONSTRAINT %I', nombre_fk);
+        END IF;
+
+        IF NOT EXISTS (
+          SELECT 1 FROM information_schema.table_constraints
+          WHERE constraint_name = 'fotos_avance_usuario_id_set_null'
+        ) THEN
+          ALTER TABLE fotos_avance ADD CONSTRAINT fotos_avance_usuario_id_set_null
+            FOREIGN KEY (usuario_id) REFERENCES usuarios(id) ON DELETE SET NULL;
+        END IF;
+      END $$;
+    `);
+    await pool.query(`ALTER TABLE planos_3d ALTER COLUMN usuario_id DROP NOT NULL`);
+    await pool.query(`
+      DO $$
+      DECLARE nombre_fk TEXT;
+      BEGIN
+        SELECT tc.constraint_name INTO nombre_fk
+        FROM information_schema.table_constraints tc
+        JOIN information_schema.key_column_usage kcu ON kcu.constraint_name = tc.constraint_name
+        WHERE tc.table_name = 'planos_3d' AND tc.constraint_type = 'FOREIGN KEY' AND kcu.column_name = 'usuario_id'
+        LIMIT 1;
+
+        IF nombre_fk IS NOT NULL THEN
+          EXECUTE format('ALTER TABLE planos_3d DROP CONSTRAINT %I', nombre_fk);
+        END IF;
+
+        IF NOT EXISTS (
+          SELECT 1 FROM information_schema.table_constraints
+          WHERE constraint_name = 'planos_3d_usuario_id_set_null'
+        ) THEN
+          ALTER TABLE planos_3d ADD CONSTRAINT planos_3d_usuario_id_set_null
+            FOREIGN KEY (usuario_id) REFERENCES usuarios(id) ON DELETE SET NULL;
+        END IF;
+      END $$;
+    `);
+
+    // Mismo criterio de "conservar el contenido, solo desvincular el usuario_id" para mensajes
+    // (remitente y destinatario) y archivos adjuntos: necesario para poder eliminar a alguien de
+    // la plataforma por completo (DELETE /api/areas/personal/:usuario_id/total en areas.js) sin
+    // que el DELETE FROM usuarios falle por constraint de FK. El nombre del remitente se conserva
+    // aparte vía remitente_nombre_snapshot (ver arriba), así que perder mensajes.usuario_id no
+    // rompe el chat — solo dejaría de poder filtrar/enlazar ese mensaje a una cuenta activa.
+    for (const { tabla, columna } of [
+      { tabla: 'mensajes', columna: 'usuario_id' },
+      { tabla: 'mensajes', columna: 'destinatario_usuario_id' },
+      { tabla: 'archivos', columna: 'usuario_id' },
+    ]) {
+      await pool.query(`ALTER TABLE ${tabla} ALTER COLUMN ${columna} DROP NOT NULL`);
+      await pool.query(`
+        DO $$
+        DECLARE nombre_fk TEXT;
+        BEGIN
+          SELECT tc.constraint_name INTO nombre_fk
+          FROM information_schema.table_constraints tc
+          JOIN information_schema.key_column_usage kcu ON kcu.constraint_name = tc.constraint_name
+          WHERE tc.table_name = '${tabla}' AND tc.constraint_type = 'FOREIGN KEY' AND kcu.column_name = '${columna}'
+          LIMIT 1;
+
+          IF nombre_fk IS NOT NULL THEN
+            EXECUTE format('ALTER TABLE ${tabla} DROP CONSTRAINT %I', nombre_fk);
+          END IF;
+
+          IF NOT EXISTS (
+            SELECT 1 FROM information_schema.table_constraints
+            WHERE constraint_name = '${tabla}_${columna}_set_null'
+          ) THEN
+            ALTER TABLE ${tabla} ADD CONSTRAINT ${tabla}_${columna}_set_null
+              FOREIGN KEY (${columna}) REFERENCES usuarios(id) ON DELETE SET NULL;
+          END IF;
+        END $$;
+      `);
+    }
+
     console.log('✅ Esquema verificado/actualizado correctamente');
   } catch (error) {
     // No tumbamos el servidor si esto falla: preferimos que la app siga funcionando con el

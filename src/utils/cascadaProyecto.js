@@ -47,4 +47,40 @@ async function borrarDependenciasDeProyecto(client, proyectoId) {
   return urlsABorrar;
 }
 
-module.exports = { borrarDependenciasDeProyecto };
+// Lógica hermana de borrarDependenciasDeProyecto, pero para UNA sola área dentro de un proyecto
+// (ej. "Carpintería" de un proyecto puntual), en vez de todo el proyecto completo. Se usa cuando
+// gerencia elimina una actividad/área de un proyecto (DELETE /:id/actividades/:area_id en
+// proyectos_v2.js), sin importar cuánta gente esté asignada ahí. A propósito NO toca
+// estadisticas_proyecto, abonos_proyecto ni cotizaciones: esas tablas son por proyecto completo
+// (ligadas a la pestaña "Estadísticas"), no a un área específica, y deben sobrevivir intactas.
+// Mismo contrato que la función hermana: recibe `client` ya dentro de una transacción BEGIN, y
+// devuelve las URLs de Storage a borrar después del COMMIT.
+async function borrarDependenciasDeArea(client, proyectoId, areaId) {
+  const urlsABorrar = [];
+
+  const fotos = await client.query('SELECT foto_url FROM fotos_avance WHERE proyecto_id = $1 AND area_id = $2', [proyectoId, areaId]);
+  fotos.rows.forEach((f) => f.foto_url && urlsABorrar.push(f.foto_url));
+
+  const planos = await client.query('SELECT url_glb FROM planos_3d WHERE proyecto_id = $1 AND area_id = $2', [proyectoId, areaId]);
+  planos.rows.forEach((p) => p.url_glb && urlsABorrar.push(p.url_glb));
+
+  const mensajesDelArea = await client.query('SELECT id FROM mensajes WHERE proyecto_id = $1 AND area_id = $2', [proyectoId, areaId]);
+  const idsMensajes = mensajesDelArea.rows.map((m) => m.id);
+  if (idsMensajes.length > 0) {
+    const archivosChat = await client.query('SELECT url_archivo FROM archivos WHERE mensaje_id = ANY($1::int[])', [idsMensajes]);
+    archivosChat.rows.forEach((a) => a.url_archivo && urlsABorrar.push(a.url_archivo));
+    await client.query('DELETE FROM archivos WHERE mensaje_id = ANY($1::int[])', [idsMensajes]);
+  }
+
+  await client.query('DELETE FROM mensajes WHERE proyecto_id = $1 AND area_id = $2', [proyectoId, areaId]);
+  await client.query('DELETE FROM fotos_avance WHERE proyecto_id = $1 AND area_id = $2', [proyectoId, areaId]);
+  await client.query('DELETE FROM planos_3d WHERE proyecto_id = $1 AND area_id = $2', [proyectoId, areaId]);
+  // Toda persona asignada a esta área en este proyecto (vinculada o pendiente) queda desasignada
+  // de ESTE proyecto — su cuenta y su vínculo con la empresa no se tocan, solo esta asignación.
+  await client.query('DELETE FROM proyecto_equipo WHERE proyecto_id = $1 AND area_id = $2', [proyectoId, areaId]);
+  await client.query('DELETE FROM proyecto_actividades WHERE proyecto_id = $1 AND area_id = $2', [proyectoId, areaId]);
+
+  return urlsABorrar;
+}
+
+module.exports = { borrarDependenciasDeProyecto, borrarDependenciasDeArea };

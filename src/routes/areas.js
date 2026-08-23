@@ -224,6 +224,114 @@ router.delete('/personal/vinculado/:rol_id', async (req, res) => {
   }
 });
 
+// 🗑️💥 ELIMINAR a una persona de TODA la plataforma, aunque esté asignada a proyectos: borra su
+// cuenta (tabla usuarios), todos sus vínculos con empresas (usuario_empresa_rol), todas sus
+// asignaciones a proyectos (proyecto_equipo), y su documento ARL. Distinto del DELETE de arriba
+// (que solo desactiva el vínculo con UNA empresa, sin tocar la cuenta ni las asignaciones) y
+// también distinto de DELETE /api/proyectos/equipo/:asignacion_id (que solo quita a alguien de
+// UN proyecto puntual, sin tocar su cuenta) — ese último sigue existiendo tal cual para "quitar
+// de este proyecto" sin eliminar a la persona de la plataforma.
+//
+// Qué se CONSERVA a propósito (decisión explícita, no un descuido):
+// - Mensajes de chat: no se borran. Antes de eliminar la cuenta, cada mensaje que esta persona
+//   envió ya tiene guardado su nombre en remitente_nombre_snapshot (se llena al momento de
+//   enviar, ver mensajes.js), así que el chat de la otra persona en la conversación se sigue
+//   viendo completo con el nombre correcto, aunque la cuenta ya no exista.
+// - Fotos de avance y planos 3D que esta persona subió: se conservan como evidencia de obra;
+//   solo se desvincula el usuario_id (queda en NULL vía ON DELETE SET NULL, configurado en
+//   migraciones.js).
+router.delete('/personal/:usuario_id/total', async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const { usuario_id } = req.params;
+    const { empresa_id, solicitante_id } = req.body;
+
+    if (!empresa_id || !solicitante_id) {
+      return res.status(400).json({ error: 'empresa_id y solicitante_id son obligatorios' });
+    }
+
+    if (Number(usuario_id) === Number(solicitante_id)) {
+      return res.status(400).json({ error: 'No puedes eliminarte a ti mismo de la plataforma.' });
+    }
+
+    const usuarioResult = await client.query('SELECT id, nombre FROM usuarios WHERE id = $1', [usuario_id]);
+    if (usuarioResult.rows.length === 0) {
+      return res.status(404).json({ error: 'Persona no encontrada' });
+    }
+
+    const areaObjetivo = await areaDeUsuarioEnEmpresa(usuario_id, empresa_id);
+    const areaSolicitante = await areaDeUsuarioEnEmpresa(solicitante_id, empresa_id);
+    if (areaObjetivo === 'GERENCIA' && areaSolicitante !== 'GERENCIA') {
+      return res.status(403).json({ error: 'Solo Gerencia puede eliminar a otra persona de Gerencia' });
+    }
+
+    // No permitir dejar NINGUNA empresa sin Gerencia: como esta persona puede ser Gerencia de
+    // VARIAS empresas a la vez (no solo la que solicita el borrado), y el DELETE más abajo la
+    // elimina de TODAS, revisamos TODAS las empresas donde hoy es Gerencia activa — no solo
+    // `empresa_id`. Si en alguna de ellas es la última Gerencia, bloqueamos el borrado completo.
+    const empresasComoGerencia = await client.query(
+      `SELECT uer.empresa_id, e.nombre AS empresa_nombre
+       FROM usuario_empresa_rol uer
+       JOIN areas_catalogo a ON a.id = uer.area_id
+       JOIN empresas e ON e.id = uer.empresa_id
+       WHERE uer.usuario_id = $1 AND uer.estado = 'activo' AND a.nombre = 'GERENCIA'`,
+      [usuario_id]
+    );
+    for (const fila of empresasComoGerencia.rows) {
+      const otrosGerencia = await client.query(
+        `SELECT COUNT(*) AS total FROM usuario_empresa_rol uer
+         JOIN areas_catalogo a ON a.id = uer.area_id
+         WHERE uer.empresa_id = $1 AND uer.estado = 'activo' AND a.nombre = 'GERENCIA' AND uer.usuario_id != $2`,
+        [fila.empresa_id, usuario_id]
+      );
+      if (Number(otrosGerencia.rows[0].total) === 0) {
+        return res.status(400).json({
+          error: `No puedes eliminar a esta persona: es la única Gerencia de "${fila.empresa_nombre}" y esa empresa quedaría sin nadie a cargo.`,
+        });
+      }
+    }
+
+    await client.query('BEGIN');
+
+    // Documento ARL: se borra la referencia (el archivo real de Storage se limpia después, fuera
+    // de la transacción, igual que el resto de archivos de esta app).
+    const urlsABorrar = [];
+    const arl = await client.query('SELECT arl_documento_url FROM usuarios WHERE id = $1', [usuario_id]);
+    if (arl.rows[0]?.arl_documento_url) urlsABorrar.push(arl.rows[0].arl_documento_url);
+
+    // Cualquier proyecto donde esté asignada (en cualquier empresa, no solo esta) queda
+    // desasignado. El chat que ya tuvo con otros queda intacto gracias al snapshot de nombre.
+    await client.query('DELETE FROM proyecto_equipo WHERE usuario_id = $1', [usuario_id]);
+
+    // Vínculos con TODAS las empresas (no solo la de quien solicita eliminar), ya que la cuenta
+    // completa va a desaparecer.
+    await client.query('DELETE FROM usuario_empresa_rol WHERE usuario_id = $1', [usuario_id]);
+
+    // fotos_avance.usuario_id, planos_3d.usuario_id, mensajes.usuario_id,
+    // mensajes.destinatario_usuario_id y archivos.usuario_id tienen todos ON DELETE SET NULL
+    // (ver migraciones.js), así que se desvinculan solos al borrar la fila de usuarios — no hace
+    // falta tocarlos aquí explícitamente. El nombre del remitente en cada mensaje ya quedó a
+    // salvo en remitente_nombre_snapshot antes de este momento (se llena al enviar el mensaje).
+    await client.query('DELETE FROM usuarios WHERE id = $1', [usuario_id]);
+
+    await client.query('COMMIT');
+
+    for (const url of urlsABorrar) {
+      await borrarArchivoDeStorage(url).catch((error) => {
+        console.error('Error borrando archivo ARL de Storage al eliminar persona:', error.message);
+      });
+    }
+
+    res.json({ mensaje: 'Persona eliminada de la plataforma exitosamente' });
+  } catch (error) {
+    await client.query('ROLLBACK');
+    console.error('Error eliminando persona de la plataforma:', error);
+    res.status(500).json({ error: 'No se pudo eliminar a esta persona. Intenta de nuevo.' });
+  } finally {
+    client.release();
+  }
+});
+
 // 📄 SUBIR/ACTUALIZAR documento ARL (riesgos profesionales) de una persona vinculada.
 // El archivo ya fue subido a Firebase Storage desde el frontend; aquí se guarda la referencia
 // (url) y la fecha de vencimiento, y se borra de Storage el documento anterior (si había uno)

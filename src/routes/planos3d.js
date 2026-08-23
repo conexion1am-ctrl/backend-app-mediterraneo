@@ -57,9 +57,9 @@ router.get('/:proyecto_id/:area_id', async (req, res) => {
   try {
     const { proyecto_id, area_id } = req.params;
     const result = await pool.query(
-      `SELECT pl.*, u.nombre AS usuario_nombre
+      `SELECT pl.*, COALESCE(u.nombre, 'Usuario eliminado') AS usuario_nombre
        FROM planos_3d pl
-       JOIN usuarios u ON u.id = pl.usuario_id
+       LEFT JOIN usuarios u ON u.id = pl.usuario_id
        WHERE pl.proyecto_id = $1 AND pl.area_id = $2
        ORDER BY pl.created_at DESC`,
       [proyecto_id, area_id]

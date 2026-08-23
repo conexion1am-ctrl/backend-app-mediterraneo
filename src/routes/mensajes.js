@@ -45,9 +45,15 @@ router.post('/enviar', async (req, res) => {
       return res.status(400).json({ error: 'proyecto_id, area_id, usuario_id, destinatario_usuario_id y (contenido o archivo) son obligatorios' });
     }
 
+    // Guardamos el nombre del remitente tal como es HOY como respaldo (remitente_nombre_snapshot):
+    // si esa persona es eliminada de la plataforma más adelante, el chat sigue mostrando su
+    // nombre en vez de romperse — ver el SELECT más abajo, que usa LEFT JOIN + COALESCE.
+    const remitenteActual = await pool.query('SELECT nombre FROM usuarios WHERE id = $1', [usuario_id]);
+    const nombreRemitenteActual = remitenteActual.rows[0]?.nombre || null;
+
     const result = await pool.query(
-      'INSERT INTO mensajes (proyecto_id, area_id, usuario_id, destinatario_usuario_id, contenido) VALUES ($1, $2, $3, $4, $5) RETURNING *',
-      [proyecto_id, area_id, usuario_id, destinatario_usuario_id, contenido || '']
+      'INSERT INTO mensajes (proyecto_id, area_id, usuario_id, destinatario_usuario_id, contenido, remitente_nombre_snapshot) VALUES ($1, $2, $3, $4, $5, $6) RETURNING *',
+      [proyecto_id, area_id, usuario_id, destinatario_usuario_id, contenido || '', nombreRemitenteActual]
     );
 
     // Si el mensaje viene con un archivo (foto/documento), lo guardamos vinculado a este mensaje.
@@ -97,10 +103,14 @@ router.get('/:proyecto_id/:area_id/:destinatario_usuario_id', async (req, res) =
   try {
     const { proyecto_id, area_id, destinatario_usuario_id } = req.params;
 
+    // LEFT JOIN (no INNER JOIN) a propósito: si el remitente fue eliminado de la plataforma por
+    // completo, u.id es NULL pero el mensaje se sigue mostrando — COALESCE usa el nombre actual
+    // de la cuenta si todavía existe, o el snapshot guardado al momento de enviarlo si no.
     const result = await pool.query(
-      `SELECT m.id, m.contenido, m.created_at, u.id AS usuario_id, u.nombre AS usuario_nombre
+      `SELECT m.id, m.contenido, m.created_at, m.usuario_id,
+              COALESCE(u.nombre, m.remitente_nombre_snapshot, 'Usuario eliminado') AS usuario_nombre
        FROM mensajes m
-       JOIN usuarios u ON u.id = m.usuario_id
+       LEFT JOIN usuarios u ON u.id = m.usuario_id
        WHERE m.proyecto_id = $1 AND m.area_id = $2 AND m.destinatario_usuario_id = $3
        ORDER BY m.created_at ASC`,
       [proyecto_id, area_id, destinatario_usuario_id]

@@ -4,7 +4,7 @@ const router = express.Router();
 require('dotenv').config();
 const { esGerencia } = require('../utils/permisos');
 const { borrarArchivoDeStorage } = require('../utils/firebaseAdmin');
-const { borrarDependenciasDeProyecto } = require('../utils/cascadaProyecto');
+const { borrarDependenciasDeProyecto, borrarDependenciasDeArea } = require('../utils/cascadaProyecto');
 const { vaciarChat } = require('./mensajes');
 
 const pool = new Pool({
@@ -291,6 +291,45 @@ router.post('/:id/actividades/agregar', async (req, res) => {
   } catch (error) {
     console.error('Error agregando actividad:', error);
     res.status(500).json({ error: 'Error al agregar actividad' });
+  }
+});
+
+// 🗑️ ELIMINAR una actividad/área de un proyecto, con TODO lo que tenga adentro: chats y sus
+// archivos adjuntos, fotos de avance, diseños/planos 3D, y cualquier persona asignada a esa área
+// en este proyecto (su cuenta y su vínculo con la empresa NO se tocan, solo esta asignación
+// puntual). No afecta estadísticas/abonos del proyecto (son por proyecto completo, no por área).
+router.delete('/:id/actividades/:area_id', async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const { id, area_id } = req.params;
+
+    const existe = await client.query(
+      'SELECT * FROM proyecto_actividades WHERE proyecto_id = $1 AND area_id = $2',
+      [id, area_id]
+    );
+    if (existe.rows.length === 0) {
+      return res.status(404).json({ error: 'Esta actividad no está agregada a este proyecto' });
+    }
+
+    await client.query('BEGIN');
+    const urlsABorrar = await borrarDependenciasDeArea(client, id, area_id);
+    await client.query('COMMIT');
+
+    // Limpiamos Storage ya con la base de datos consistente (mismo criterio "best effort" que el
+    // resto de la app): si algo falla aquí, no revertimos la base de datos.
+    for (const url of urlsABorrar) {
+      await borrarArchivoDeStorage(url).catch((error) => {
+        console.error('Error borrando archivo de Storage al eliminar actividad:', error.message);
+      });
+    }
+
+    res.json({ mensaje: 'Actividad eliminada exitosamente, junto con todo su contenido' });
+  } catch (error) {
+    await client.query('ROLLBACK');
+    console.error('Error eliminando actividad:', error);
+    res.status(500).json({ error: 'No se pudo eliminar la actividad. Intenta de nuevo.' });
+  } finally {
+    client.release();
   }
 });
 

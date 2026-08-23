@@ -8,7 +8,6 @@ const aplicarMigraciones = require('./migraciones');
 const app = express();
 
 setupDatabase();
-aplicarMigraciones();
 
 // Middleware
 app.use(cors());
@@ -47,8 +46,21 @@ app.get('/api/health', (req, res) => {
   res.json({ message: 'Servidor funcionando correctamente', timestamp: new Date() });
 });
 
-// Iniciar servidor
+// Iniciar servidor. Esperamos a que las migraciones terminen ANTES de aceptar tráfico HTTP: antes
+// "aplicarMigraciones()" se llamaba sin esperar su resultado, así que el servidor podía empezar a
+// responder requests mientras las migraciones (varios ALTER TABLE secuenciales) seguían corriendo
+// en segundo plano — en el primer arranque tras un cambio de esquema, una petición que llegara en
+// esa ventana podía fallar contra columnas/constraints que todavía no existían.
 const PORT = process.env.PORT || 5000;
-app.listen(PORT, () => {
-  console.log(`✓ Servidor ejecutándose en puerto ${PORT}`);
-});
+aplicarMigraciones()
+  .catch((error) => {
+    // No tumbamos el servidor si esto falla: preferimos que la app siga funcionando con el
+    // esquema anterior a que un problema de migración deje todo caído (mismo criterio usado
+    // dentro de aplicarMigraciones para sus propios errores internos).
+    console.error('❌ Error inesperado esperando migraciones:', error.message);
+  })
+  .finally(() => {
+    app.listen(PORT, () => {
+      console.log(`✓ Servidor ejecutándose en puerto ${PORT}`);
+    });
+  });
