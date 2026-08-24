@@ -104,6 +104,27 @@ router.post('/:id/equipo/asignar', async (req, res) => {
       return res.status(400).json({ error: 'area_id y (usuario_id o invitacion_id) son obligatorios' });
     }
 
+    // Antes de insertar, verificamos si esta MISMA persona ya está asignada a este proyecto (en
+    // cualquier área, no solo en area_id) — esto es lo que causaba el bug de "fichas duplicadas":
+    // tocar el botón Asignar varias veces (o para la misma persona en distintas pestañas de área)
+    // creaba una fila nueva cada vez en proyecto_equipo, y el equipo del proyecto mostraba a la
+    // misma persona repetida 2 o 3 veces. Si ya existe una asignación activa, no duplicamos: le
+    // avisamos al frontend que ya estaba asignada en vez de crear una fila más.
+    const yaAsignada = await pool.query(
+      `SELECT id, area_id FROM proyecto_equipo
+       WHERE proyecto_id = $1
+         AND ((usuario_id IS NOT NULL AND usuario_id = $2::int)
+           OR (invitacion_id IS NOT NULL AND invitacion_id = $3::int))`,
+      [id, usuario_id || null, invitacion_id || null]
+    );
+    if (yaAsignada.rows.length > 0) {
+      return res.status(200).json({
+        mensaje: 'Esta persona ya estaba asignada a este proyecto',
+        asignacion: yaAsignada.rows[0],
+        yaExistia: true,
+      });
+    }
+
     const result = await pool.query(
       'INSERT INTO proyecto_equipo (proyecto_id, usuario_id, invitacion_id, area_id) VALUES ($1, $2, $3, $4) RETURNING *',
       [id, usuario_id || null, invitacion_id || null, area_id]
@@ -133,7 +154,8 @@ router.get('/:id/equipo', async (req, res) => {
     const { id } = req.params;
     const { solicitante_id } = req.query;
     const result = await pool.query(
-      `SELECT pe.id AS asignacion_id,
+      `SELECT DISTINCT ON (COALESCE(pe.usuario_id::text, 'inv-' || pe.invitacion_id::text))
+              pe.id AS asignacion_id,
               COALESCE(u.id, NULL) AS usuario_id,
               COALESCE(u.nombre, i.nombre_invitado) AS nombre,
               COALESCE(u.celular, i.celular_invitado) AS celular,
@@ -162,10 +184,17 @@ router.get('/:id/equipo', async (req, res) => {
        LEFT JOIN invitaciones i ON i.id = pe.invitacion_id
        JOIN areas_catalogo a ON a.id = pe.area_id
        WHERE pe.proyecto_id = $1
-       ORDER BY a.nombre`,
+       -- DISTINCT ON exige que el primer campo del ORDER BY sea la misma expresión de arriba;
+       -- dentro de cada persona duplicada nos quedamos con la fila de asignación más antigua
+       -- (pe.id menor), y luego ordenamos el resultado final por nombre de área como antes.
+       ORDER BY COALESCE(pe.usuario_id::text, 'inv-' || pe.invitacion_id::text), pe.id ASC`,
       [id, solicitante_id || null]
     );
-    res.json({ equipo: result.rows });
+    // El DISTINCT ON de Postgres no permite además un ORDER BY final por a.nombre en la misma
+    // consulta (su primer criterio de orden debe ser la expresión del DISTINCT ON), así que
+    // ordenamos por área aquí, ya con los duplicados fuera.
+    const equipoOrdenado = result.rows.sort((a, b) => a.area_nombre.localeCompare(b.area_nombre));
+    res.json({ equipo: equipoOrdenado });
   } catch (error) {
     console.error('Error obteniendo equipo:', error);
     res.status(500).json({ error: 'Error al obtener equipo del proyecto' });

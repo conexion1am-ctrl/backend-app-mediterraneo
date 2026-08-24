@@ -99,9 +99,23 @@ router.post('/enviar', async (req, res) => {
 });
 
 // 👁️ VER la conversación individual con una persona específica, dentro de un área y proyecto
+//
+// "mi_usuario_id" (query param obligatorio): el usuario_id de quien está pidiendo el chat (el
+// que está mirando la pantalla). ANTES este endpoint solo filtraba por destinatario_usuario_id
+// = el OTRO participante, sin comparar nunca contra quién soy yo — eso traía "todos los mensajes
+// dirigidos a esa persona", no "la conversación entre nosotros dos". El resultado real: cada
+// quien solo veía los mensajes que ÉL MISMO había enviado (porque casi siempre coincidía con ser
+// el remitente de los mensajes "dirigidos al otro" en su propia consulta), y nunca las
+// respuestas — el chat parecía "no recibir nada" en ambos sentidos. El WHERE correcto ya existía
+// en vaciarChat() más abajo en este mismo archivo; aquí faltaba aplicar el mismo patrón simétrico.
 router.get('/:proyecto_id/:area_id/:destinatario_usuario_id', async (req, res) => {
   try {
     const { proyecto_id, area_id, destinatario_usuario_id } = req.params;
+    const { mi_usuario_id } = req.query;
+
+    if (!mi_usuario_id) {
+      return res.status(400).json({ error: 'mi_usuario_id es obligatorio' });
+    }
 
     // LEFT JOIN (no INNER JOIN) a propósito: si el remitente fue eliminado de la plataforma por
     // completo, u.id es NULL pero el mensaje se sigue mostrando — COALESCE usa el nombre actual
@@ -111,9 +125,11 @@ router.get('/:proyecto_id/:area_id/:destinatario_usuario_id', async (req, res) =
               COALESCE(u.nombre, m.remitente_nombre_snapshot, 'Usuario eliminado') AS usuario_nombre
        FROM mensajes m
        LEFT JOIN usuarios u ON u.id = m.usuario_id
-       WHERE m.proyecto_id = $1 AND m.area_id = $2 AND m.destinatario_usuario_id = $3
+       WHERE m.proyecto_id = $1 AND m.area_id = $2
+         AND ((m.usuario_id = $3::int AND m.destinatario_usuario_id = $4::int)
+           OR (m.usuario_id = $4::int AND m.destinatario_usuario_id = $3::int))
        ORDER BY m.created_at ASC`,
-      [proyecto_id, area_id, destinatario_usuario_id]
+      [proyecto_id, area_id, mi_usuario_id, destinatario_usuario_id]
     );
 
     // Traemos los archivos adjuntos de todos estos mensajes en una sola consulta y los

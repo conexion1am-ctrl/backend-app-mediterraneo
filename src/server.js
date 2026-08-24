@@ -26,6 +26,10 @@ const areasRoutes = require('./routes/areas');
 const authRoutes = require('./routes/auth');
 const fotosAvanceRoutes = require('./routes/fotos_avance');
 const planos3dRoutes = require('./routes/planos3d');
+// Temporal (2026-08-24): endpoint de un solo uso para limpiar asignaciones duplicadas en
+// proyecto_equipo, causadas por un bug ya corregido. Quitar este require Y la línea app.use de
+// abajo juntos, en el mismo commit, cuando ya no se necesite — ver comentario en mantenimiento.js.
+const mantenimientoRoutes = require('./routes/mantenimiento');
 
 // Usar rutas
 app.use('/api/proyectos', proyectosRoutes);
@@ -39,6 +43,7 @@ app.use('/api/areas', areasRoutes);
 app.use('/api/auth', authRoutes);
 app.use('/api/fotos-avance', fotosAvanceRoutes);
 app.use('/api/planos-3d', planos3dRoutes);
+app.use('/api/mantenimiento', mantenimientoRoutes);
 
 
 // Rutas básicas
