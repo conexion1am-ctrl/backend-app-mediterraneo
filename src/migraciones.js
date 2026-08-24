@@ -211,6 +211,59 @@ async function aplicarMigraciones() {
       `);
     }
 
+    // areas_catalogo: catálogo fijo de áreas (Gerencia, Administrativa, Logística, Comercial,
+    // Proveedores, Clientes, y las 10 "subáreas" de oficio: Obra Civil, Electricidad, etc.). Esta
+    // tabla NUNCA se vuelve a llenar sola si queda vacía (por ejemplo, tras un vaciado accidental
+    // de la base de datos) — a diferencia de otras tablas de este archivo, no tiene ningún dueño
+    // que la resiembre. El 2026-08-24 un vaciado completo de la BD la dejó vacía y nadie se dio
+    // cuenta hasta que "Crear mi empresa" empezó a fallar siempre (el endpoint busca el area_id
+    // de GERENCIA y explota si no existe ninguna fila). Este bloque la resiembra automáticamente
+    // en cada arranque SOLO si está vacía (no duplica nada si ya tiene datos), para que este
+    // problema nunca vuelva a ocurrir aunque la tabla se vacíe por accidente en el futuro.
+    // Nombres tomados textualmente de los documentos de especificación originales del proyecto
+    // (Especificacion_App_Mediterraneo.docx) y confirmados con seed-areas.js (el seed original,
+    // que sembraba la tabla legada "areas_trabajo" con estos mismos 10 nombres).
+    // pg_advisory_lock: evita que dos instancias del servidor arrancando al mismo tiempo (ej. un
+    // rolling deploy de Render) vean ambas "la tabla está vacía" y ambas intenten sembrarla a la
+    // vez (duplicados, o un INSERT chocando con otro a mitad del loop). El lock es exclusivo a
+    // nivel de sesión de Postgres — la segunda instancia simplemente espera a que la primera
+    // termine y libere el lock antes de hacer su propio SELECT COUNT(*), que para ese momento ya
+    // no será 0. Se usa un client dedicado (no el pool genérico) porque el lock/unlock debe
+    // ejecutarse sobre la MISMA conexión.
+    const clienteLock = await pool.connect();
+    try {
+      await clienteLock.query('SELECT pg_advisory_lock(881234)'); // número arbitrario, solo debe ser único para este propósito
+      const areasExistentes = await clienteLock.query('SELECT COUNT(*) FROM areas_catalogo');
+      if (Number(areasExistentes.rows[0].count) === 0) {
+        console.log('⚠️ areas_catalogo está vacía — resembrando catálogo de áreas...');
+        const areasSemilla = [
+          { nombre: 'GERENCIA', tipo: 'administrativa' },
+          { nombre: 'AREA ADMINISTRATIVA', tipo: 'administrativa' },
+          { nombre: 'AREA DE LOGISTICA', tipo: 'administrativa' },
+          { nombre: 'AREA COMERCIAL', tipo: 'administrativa' },
+          { nombre: 'AREA DE PROVEEDORES', tipo: 'especial' },
+          { nombre: 'AREA DE CLIENTES', tipo: 'especial' },
+          { nombre: 'Obra Civil', tipo: 'oficio' },
+          { nombre: 'Electricidad', tipo: 'oficio' },
+          { nombre: 'Hidráulica', tipo: 'oficio' },
+          { nombre: 'Redes de Gas', tipo: 'oficio' },
+          { nombre: 'Estuco', tipo: 'oficio' },
+          { nombre: 'Enchapes', tipo: 'oficio' },
+          { nombre: 'Pintura', tipo: 'oficio' },
+          { nombre: 'Drywall', tipo: 'oficio' },
+          { nombre: 'Carpintería', tipo: 'oficio' },
+          { nombre: 'Aseo', tipo: 'oficio' },
+        ];
+        for (const area of areasSemilla) {
+          await clienteLock.query('INSERT INTO areas_catalogo (nombre, tipo) VALUES ($1, $2)', [area.nombre, area.tipo]);
+        }
+        console.log('✅ areas_catalogo resembrada con', areasSemilla.length, 'áreas');
+      }
+    } finally {
+      await clienteLock.query('SELECT pg_advisory_unlock(881234)').catch(() => {});
+      clienteLock.release();
+    }
+
     console.log('✅ Esquema verificado/actualizado correctamente');
   } catch (error) {
     // No tumbamos el servidor si esto falla: preferimos que la app siga funcionando con el
