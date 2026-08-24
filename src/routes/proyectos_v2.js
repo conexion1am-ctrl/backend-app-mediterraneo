@@ -119,9 +119,19 @@ router.post('/:id/equipo/asignar', async (req, res) => {
 // 👥 VER equipo asignado a un proyecto (agrupado por área)
 // Trae tanto personal ya vinculado (usuario real) como personal pendiente (invitación sin
 // aceptar todavía), para que gerencia pueda ver quién quedó asignado desde el primer momento.
+//
+// "solicitante_id" (query param opcional): el usuario_id de quien está pidiendo este listado.
+// Se usa SOLO para calcular "le_ha_escrito" en las filas de GERENCIA: un trabajador de oficio
+// (o Proveedor/Cliente) no debe poder iniciar una conversación con un gerente por su cuenta —
+// esa fila solo debe volverse visible en el frontend después de que ESE gerente le haya escrito
+// primero al solicitante. Área Administrativa y Área de Logística no tienen esta restricción
+// (siguen siendo contactables libremente), así que el EXISTS solo se calcula cuando
+// a.nombre = 'GERENCIA'; para cualquier otra área, "le_ha_escrito" simplemente viene en null
+// y el frontend lo ignora.
 router.get('/:id/equipo', async (req, res) => {
   try {
     const { id } = req.params;
+    const { solicitante_id } = req.query;
     const result = await pool.query(
       `SELECT pe.id AS asignacion_id,
               COALESCE(u.id, NULL) AS usuario_id,
@@ -129,14 +139,31 @@ router.get('/:id/equipo', async (req, res) => {
               COALESCE(u.celular, i.celular_invitado) AS celular,
               a.id AS area_id, a.nombre AS area_nombre,
               pe.pausado,
-              CASE WHEN pe.usuario_id IS NOT NULL THEN 'vinculado' ELSE 'pendiente' END AS estado
+              CASE WHEN pe.usuario_id IS NOT NULL THEN 'vinculado' ELSE 'pendiente' END AS estado,
+              CASE
+                WHEN a.nombre = 'GERENCIA' AND $2::int IS NOT NULL THEN EXISTS (
+                  -- OJO: NO filtramos por área aquí a propósito. El chat siempre se envía con el
+                  -- area_id de la PANTALLA desde la que se escribe (ej. si Gerencia entra a la
+                  -- pestaña Equipo de Carpintería para hablarle a un carpintero, el mensaje queda
+                  -- con area_id = Carpintería, no el area_id propio de Gerencia en
+                  -- proyecto_equipo). Filtrar por área aquí casi nunca coincidiría con el mensaje
+                  -- real, dejando "le_ha_escrito" siempre en false. Lo que importa es solo:
+                  -- ¿ESTE gerente (pe.usuario_id) le escribió alguna vez a ESTE solicitante, en
+                  -- ESTE proyecto? — sin importar desde qué pestaña de área lo hizo.
+                  SELECT 1 FROM mensajes m
+                  WHERE m.proyecto_id = pe.proyecto_id
+                    AND m.usuario_id = pe.usuario_id
+                    AND m.destinatario_usuario_id = $2::int
+                )
+                ELSE NULL
+              END AS le_ha_escrito
        FROM proyecto_equipo pe
        LEFT JOIN usuarios u ON u.id = pe.usuario_id
        LEFT JOIN invitaciones i ON i.id = pe.invitacion_id
        JOIN areas_catalogo a ON a.id = pe.area_id
        WHERE pe.proyecto_id = $1
        ORDER BY a.nombre`,
-      [id]
+      [id, solicitante_id || null]
     );
     res.json({ equipo: result.rows });
   } catch (error) {
