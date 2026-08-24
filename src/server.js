@@ -39,7 +39,6 @@ app.use('/api/areas', areasRoutes);
 app.use('/api/auth', authRoutes);
 app.use('/api/fotos-avance', fotosAvanceRoutes);
 app.use('/api/planos-3d', planos3dRoutes);
-app.use('/api/mantenimiento', mantenimientoRoutes);
 
 
 // Rutas básicas
