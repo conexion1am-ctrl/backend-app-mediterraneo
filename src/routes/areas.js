@@ -332,6 +332,92 @@ router.delete('/personal/:usuario_id/total', async (req, res) => {
   }
 });
 
+// 🗑️🏢 ELIMINAR a una persona SOLO de esta empresa (no de toda la plataforma). A diferencia de
+// DELETE /personal/:usuario_id/total (que borra la cuenta entera y afecta TODAS las empresas
+// donde esta persona trabaja), este endpoint:
+// - Desactiva únicamente sus filas de usuario_empresa_rol EN ESTA empresa (deja de aparecer en
+//   Grupo de Trabajo de esta empresa y pierde acceso a ella).
+// - Borra únicamente sus asignaciones de proyecto_equipo en proyectos QUE PERTENECEN a esta
+//   empresa (proyecto_equipo no tiene columna empresa_id propia, así que se filtra vía JOIN con
+//   proyectos.empresa_id).
+// - NO toca la tabla usuarios (su cuenta sigue existiendo, puede seguir entrando con su celular
+//   si pertenece a otras empresas) ni sus vínculos/asignaciones en NINGUNA otra empresa.
+// Los chats y archivos de ESTA empresa se conservan igual que en el borrado total: los mensajes
+// ya guardan remitente_nombre_snapshot, y fotos/planos no dependen de usuario_empresa_rol para
+// existir, así que no se ven afectados por desactivar el vínculo con la empresa.
+router.delete('/personal/:usuario_id/empresa/:empresa_id', async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const { usuario_id, empresa_id } = req.params;
+    const { solicitante_id } = req.body;
+
+    if (!solicitante_id) {
+      return res.status(400).json({ error: 'solicitante_id es obligatorio' });
+    }
+
+    if (Number(usuario_id) === Number(solicitante_id)) {
+      return res.status(400).json({ error: 'No puedes eliminarte a ti mismo de la empresa.' });
+    }
+
+    const usuarioResult = await client.query('SELECT id, nombre FROM usuarios WHERE id = $1', [usuario_id]);
+    if (usuarioResult.rows.length === 0) {
+      return res.status(404).json({ error: 'Persona no encontrada' });
+    }
+
+    const areaObjetivo = await areaDeUsuarioEnEmpresa(usuario_id, empresa_id);
+    if (!areaObjetivo) {
+      return res.status(404).json({ error: 'Esta persona no pertenece a esta empresa' });
+    }
+    const areaSolicitante = await areaDeUsuarioEnEmpresa(solicitante_id, empresa_id);
+    if (areaObjetivo === 'GERENCIA' && areaSolicitante !== 'GERENCIA') {
+      return res.status(403).json({ error: 'Solo Gerencia puede eliminar a otra persona de Gerencia' });
+    }
+
+    // No dejar esta empresa (solo esta) sin Gerencia: a diferencia del borrado total, aquí solo
+    // nos importa si es la última Gerencia de ESTA empresa puntual, no de las demás donde trabaje.
+    if (areaObjetivo === 'GERENCIA') {
+      const otrosGerencia = await client.query(
+        `SELECT COUNT(*) AS total FROM usuario_empresa_rol uer
+         JOIN areas_catalogo a ON a.id = uer.area_id
+         WHERE uer.empresa_id = $1 AND uer.estado = 'activo' AND a.nombre = 'GERENCIA' AND uer.usuario_id != $2`,
+        [empresa_id, usuario_id]
+      );
+      if (Number(otrosGerencia.rows[0].total) === 0) {
+        return res.status(400).json({
+          error: 'No puedes eliminar a esta persona: es la única Gerencia de esta empresa y quedaría sin nadie a cargo.',
+        });
+      }
+    }
+
+    await client.query('BEGIN');
+
+    // Solo proyectos de ESTA empresa (proyecto_equipo no tiene empresa_id propia, se filtra
+    // uniendo con proyectos). El chat que ya tuvo con otros en estos proyectos queda intacto.
+    await client.query(
+      `DELETE FROM proyecto_equipo pe
+       USING proyectos p
+       WHERE pe.proyecto_id = p.id AND p.empresa_id = $1 AND pe.usuario_id = $2`,
+      [empresa_id, usuario_id]
+    );
+
+    // Solo el vínculo con ESTA empresa. Sus roles en otras empresas (si tiene) quedan intactos.
+    await client.query(
+      `UPDATE usuario_empresa_rol SET estado = 'inactivo' WHERE usuario_id = $1 AND empresa_id = $2`,
+      [usuario_id, empresa_id]
+    );
+
+    await client.query('COMMIT');
+
+    res.json({ mensaje: 'Persona eliminada de esta empresa exitosamente' });
+  } catch (error) {
+    await client.query('ROLLBACK');
+    console.error('Error eliminando persona de la empresa:', error);
+    res.status(500).json({ error: 'No se pudo eliminar a esta persona de la empresa. Intenta de nuevo.' });
+  } finally {
+    client.release();
+  }
+});
+
 // 📄 SUBIR/ACTUALIZAR documento ARL (riesgos profesionales) de una persona vinculada.
 // El archivo ya fue subido a Firebase Storage desde el frontend; aquí se guarda la referencia
 // (url) y la fecha de vencimiento, y se borra de Storage el documento anterior (si había uno)
