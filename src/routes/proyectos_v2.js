@@ -177,14 +177,12 @@ router.get('/:id/equipo', async (req, res) => {
               CASE WHEN pe.usuario_id IS NOT NULL THEN 'vinculado' ELSE 'pendiente' END AS estado,
               CASE
                 WHEN a.nombre = 'GERENCIA' AND $2::int IS NOT NULL THEN EXISTS (
-                  -- OJO: NO filtramos por área aquí a propósito. El chat siempre se envía con el
-                  -- area_id de la PANTALLA desde la que se escribe (ej. si Gerencia entra a la
-                  -- pestaña Equipo de Carpintería para hablarle a un carpintero, el mensaje queda
-                  -- con area_id = Carpintería, no el area_id propio de Gerencia en
-                  -- proyecto_equipo). Filtrar por área aquí casi nunca coincidiría con el mensaje
-                  -- real, dejando "le_ha_escrito" siempre en false. Lo que importa es solo:
-                  -- ¿ESTE gerente (pe.usuario_id) le escribió alguna vez a ESTE solicitante, en
-                  -- ESTE proyecto? — sin importar desde qué pestaña de área lo hizo.
+                  -- OJO: NO filtramos por área aquí a propósito (2026-08-25: la conversación entre
+                  -- 2 personas es una sola, sin partirla por área — ver GET /:proyecto_id/:destino
+                  -- en mensajes.js). Lo único que importa es: ¿ESTE gerente (pe.usuario_id) le
+                  -- escribió alguna vez a ESTE solicitante, en ESTE proyecto? — sin importar el
+                  -- area_id de cada mensaje individual (que ahora refleja el área propia de quien
+                  -- lo envió, no la pantalla desde la que se escribió).
                   SELECT 1 FROM mensajes m
                   WHERE m.proyecto_id = pe.proyecto_id
                     AND m.usuario_id = pe.usuario_id
@@ -264,7 +262,7 @@ router.delete('/equipo/:asignacion_id', async (req, res) => {
     // el hilo entre la persona eliminada y quien hizo la petición — solo si ambos ids existen
     // (la persona ya estaba vinculada, y sabemos quién es el otro lado de esa conversación).
     if (asignacion.usuario_id && usuario_solicitante_id) {
-      await vaciarChat(client, asignacion.proyecto_id, asignacion.area_id, asignacion.usuario_id, usuario_solicitante_id);
+      await vaciarChat(client, asignacion.proyecto_id, asignacion.usuario_id, usuario_solicitante_id);
     }
 
     await client.query('DELETE FROM proyecto_equipo WHERE id = $1', [asignacion_id]);

@@ -41,14 +41,39 @@ async function enviarPush(pushToken, titulo, cuerpo, data, badge) {
   }
 }
 
-// 📝 ENVIAR mensaje en el chat individual de una persona, dentro de un área y un proyecto
+// 📝 ENVIAR mensaje en el chat individual de una persona, dentro de un proyecto (2026-08-25:
+// ya NO se recibe area_id del frontend — antes se guardaba el area_id de la FICHA desde la que
+// se estaba escribiendo, lo cual rompía el roster de personas de cada ficha: como Administrativa/
+// Logística/Gerencia tienen acceso libre entre sí, alguien de Administrativa podía escribir desde
+// la ficha de Gerencia, y el mensaje quedaba guardado bajo Gerencia — haciendo que esa persona
+// pareciera "pertenecer" a Gerencia sin estarlo (bug reportado: Alejandro no veía a Juliana en su
+// roster de Gerencia aunque ella le había escrito ahí). Ahora el area_id se calcula del lado del
+// servidor, buscando el área REAL a la que el remitente está asignado en proyecto_equipo para
+// este proyecto — así cada mensaje queda etiquetado con la ficha a la que su autor pertenece de
+// verdad, sin importar desde qué ficha lo escribió.
 router.post('/enviar', async (req, res) => {
   try {
-    const { proyecto_id, area_id, usuario_id, destinatario_usuario_id, contenido, archivo } = req.body;
+    const { proyecto_id, usuario_id, destinatario_usuario_id, contenido, archivo } = req.body;
 
     // El mensaje puede ir solo con archivo adjunto (sin texto), como en WhatsApp.
-    if (!proyecto_id || !area_id || !usuario_id || !destinatario_usuario_id || (!contenido && !archivo)) {
-      return res.status(400).json({ error: 'proyecto_id, area_id, usuario_id, destinatario_usuario_id y (contenido o archivo) son obligatorios' });
+    if (!proyecto_id || !usuario_id || !destinatario_usuario_id || (!contenido && !archivo)) {
+      return res.status(400).json({ error: 'proyecto_id, usuario_id, destinatario_usuario_id y (contenido o archivo) son obligatorios' });
+    }
+
+    // Área real del remitente en este proyecto (su fila en proyecto_equipo) — no la ficha desde
+    // la que escribió. Si por algún motivo no tiene asignación ahí (no debería pasar en el flujo
+    // normal, pero por seguridad), usamos su área activa en la empresa como respaldo.
+    const areaRemitente = await pool.query(
+      `SELECT area_id FROM proyecto_equipo WHERE proyecto_id = $1 AND usuario_id = $2 LIMIT 1`,
+      [proyecto_id, usuario_id]
+    );
+    let area_id = areaRemitente.rows[0]?.area_id || null;
+    if (!area_id) {
+      const rolActivo = await pool.query(
+        `SELECT area_id FROM usuario_empresa_rol WHERE usuario_id = $1 AND estado = 'activo' LIMIT 1`,
+        [usuario_id]
+      );
+      area_id = rolActivo.rows[0]?.area_id || null;
     }
 
     // Guardamos el nombre del remitente tal como es HOY como respaldo (remitente_nombre_snapshot):
@@ -116,7 +141,13 @@ router.post('/enviar', async (req, res) => {
   }
 });
 
-// 👁️ VER la conversación individual con una persona específica, dentro de un área y proyecto
+// 👁️ VER la conversación individual con una persona específica, dentro de un proyecto (2026-08-25:
+// ya NO se filtra por área — la conversación entre 2 personas es UNA SOLA, como WhatsApp, sin
+// importar desde qué ficha escribió cada quien. Antes, filtrar por area_id partía el chat en
+// pedazos: si Juliana escribía desde la ficha Gerencia y Alejandro respondía desde la suya propia,
+// ambos mensajes podían quedar bajo areas distintas y el chat parecía "cortado". El area_id de
+// cada mensaje se sigue guardando (ver POST /enviar) para que el roster de cada ficha sea
+// correcto, pero ya no se usa para armar ni filtrar la conversación en sí.
 //
 // "mi_usuario_id" (query param obligatorio): el usuario_id de quien está pidiendo el chat (el
 // que está mirando la pantalla). ANTES este endpoint solo filtraba por destinatario_usuario_id
@@ -124,11 +155,10 @@ router.post('/enviar', async (req, res) => {
 // dirigidos a esa persona", no "la conversación entre nosotros dos". El resultado real: cada
 // quien solo veía los mensajes que ÉL MISMO había enviado (porque casi siempre coincidía con ser
 // el remitente de los mensajes "dirigidos al otro" en su propia consulta), y nunca las
-// respuestas — el chat parecía "no recibir nada" en ambos sentidos. El WHERE correcto ya existía
-// en vaciarChat() más abajo en este mismo archivo; aquí faltaba aplicar el mismo patrón simétrico.
-router.get('/:proyecto_id/:area_id/:destinatario_usuario_id', async (req, res) => {
+// respuestas — el chat parecía "no recibir nada" en ambos sentidos.
+router.get('/:proyecto_id/:destinatario_usuario_id', async (req, res) => {
   try {
-    const { proyecto_id, area_id, destinatario_usuario_id } = req.params;
+    const { proyecto_id, destinatario_usuario_id } = req.params;
     const { mi_usuario_id } = req.query;
 
     if (!mi_usuario_id) {
@@ -143,22 +173,22 @@ router.get('/:proyecto_id/:area_id/:destinatario_usuario_id', async (req, res) =
               COALESCE(u.nombre, m.remitente_nombre_snapshot, 'Usuario eliminado') AS usuario_nombre
        FROM mensajes m
        LEFT JOIN usuarios u ON u.id = m.usuario_id
-       WHERE m.proyecto_id = $1 AND m.area_id = $2
-         AND ((m.usuario_id = $3::int AND m.destinatario_usuario_id = $4::int)
-           OR (m.usuario_id = $4::int AND m.destinatario_usuario_id = $3::int))
+       WHERE m.proyecto_id = $1
+         AND ((m.usuario_id = $2::int AND m.destinatario_usuario_id = $3::int)
+           OR (m.usuario_id = $3::int AND m.destinatario_usuario_id = $2::int))
        ORDER BY m.created_at ASC`,
-      [proyecto_id, area_id, mi_usuario_id, destinatario_usuario_id]
+      [proyecto_id, mi_usuario_id, destinatario_usuario_id]
     );
 
     // Al abrir esta conversación, se marcan como leídos todos los mensajes que el OTRO
-    // participante me escribió a mí (nunca los que yo le escribí) en esta área/proyecto puntual
-    // — mismo criterio que WhatsApp: abrir el chat marca todo lo pendiente de esa conversación,
-    // no mensaje por mensaje. Esto alimenta el indicador en cascada (Empresas → Proyecto →
+    // participante me escribió a mí (nunca los que yo le escribí) en este proyecto — mismo
+    // criterio que WhatsApp: abrir el chat marca todo lo pendiente de esa conversación, no
+    // mensaje por mensaje. Esto alimenta el indicador en cascada (Empresas → Proyecto →
     // Actividad → Persona) y el badge del ícono de la app.
     await pool.query(
       `UPDATE mensajes SET leido = true
-       WHERE proyecto_id = $1 AND area_id = $2 AND usuario_id = $3::int AND destinatario_usuario_id = $4::int AND leido = false`,
-      [proyecto_id, area_id, destinatario_usuario_id, mi_usuario_id]
+       WHERE proyecto_id = $1 AND usuario_id = $2::int AND destinatario_usuario_id = $3::int AND leido = false`,
+      [proyecto_id, destinatario_usuario_id, mi_usuario_id]
     );
 
     // Traemos los archivos adjuntos de todos estos mensajes en una sola consulta y los
@@ -251,17 +281,19 @@ router.delete('/:id', async (req, res) => {
   }
 });
 
-// Vacía COMPLETAMENTE el chat individual entre dos personas dentro de un proyecto+área: borra
-// todos los mensajes en ambos sentidos (sin importar quién envió cada uno) y todos sus archivos
-// adjuntos reales en Firebase Storage. Se exporta como función aparte (no solo como ruta HTTP)
-// para poder reutilizarla desde proyectos_v2.js cuando se elimina a alguien del proyecto por
-// completo — ahí también hay que vaciar el chat, y así no se duplica la lógica de borrado.
-async function vaciarChat(client, proyecto_id, area_id, usuario_a, usuario_b) {
+// Vacía COMPLETAMENTE el chat individual entre dos personas dentro de un proyecto (2026-08-25:
+// ya sin area_id — la conversación es una sola, sin importar desde qué ficha se escribió cada
+// mensaje, ver GET de arriba): borra todos los mensajes en ambos sentidos (sin importar quién
+// envió cada uno) y todos sus archivos adjuntos reales en Firebase Storage. Se exporta como
+// función aparte (no solo como ruta HTTP) para poder reutilizarla desde proyectos_v2.js cuando se
+// elimina a alguien del proyecto por completo — ahí también hay que vaciar el chat, y así no se
+// duplica la lógica de borrado.
+async function vaciarChat(client, proyecto_id, usuario_a, usuario_b) {
   const mensajesResult = await client.query(
     `SELECT id FROM mensajes
-     WHERE proyecto_id = $1 AND area_id = $2
-       AND ((usuario_id = $3 AND destinatario_usuario_id = $4) OR (usuario_id = $4 AND destinatario_usuario_id = $3))`,
-    [proyecto_id, area_id, usuario_a, usuario_b]
+     WHERE proyecto_id = $1
+       AND ((usuario_id = $2 AND destinatario_usuario_id = $3) OR (usuario_id = $3 AND destinatario_usuario_id = $2))`,
+    [proyecto_id, usuario_a, usuario_b]
   );
   const idsMensajes = mensajesResult.rows.map((m) => m.id);
   if (idsMensajes.length === 0) return;
@@ -277,16 +309,16 @@ async function vaciarChat(client, proyecto_id, area_id, usuario_a, usuario_b) {
   await client.query('DELETE FROM mensajes WHERE id = ANY($1::int[])', [idsMensajes]);
 }
 
-// 🗑️ VACIAR chat completo con una persona, dentro de un proyecto y área (endpoint HTTP, usado
-// desde el menú de long-press en el equipo del proyecto — "Eliminar chat"). Cualquiera de los
-// dos participantes del chat puede vaciarlo, a diferencia de eliminar un solo mensaje (que solo
-// puede hacerlo quien lo envió).
-router.delete('/vaciar/:proyecto_id/:area_id/:usuario_a/:usuario_b', async (req, res) => {
+// 🗑️ VACIAR chat completo con una persona, dentro de un proyecto (endpoint HTTP, usado desde el
+// menú de long-press en el equipo del proyecto — "Eliminar chat"). Cualquiera de los dos
+// participantes del chat puede vaciarlo, a diferencia de eliminar un solo mensaje (que solo puede
+// hacerlo quien lo envió).
+router.delete('/vaciar/:proyecto_id/:usuario_a/:usuario_b', async (req, res) => {
   const client = await pool.connect();
   try {
-    const { proyecto_id, area_id, usuario_a, usuario_b } = req.params;
+    const { proyecto_id, usuario_a, usuario_b } = req.params;
     await client.query('BEGIN');
-    await vaciarChat(client, proyecto_id, area_id, usuario_a, usuario_b);
+    await vaciarChat(client, proyecto_id, usuario_a, usuario_b);
     await client.query('COMMIT');
     res.json({ mensaje: 'Chat vaciado exitosamente' });
   } catch (error) {
@@ -326,49 +358,6 @@ router.get('/no-leidos/:usuario_id', async (req, res) => {
   } catch (error) {
     console.error('Error listando mensajes sin leer:', error);
     res.status(500).json({ error: 'Error al listar mensajes sin leer' });
-  }
-});
-
-// 🔧 TEMPORAL — endpoint de diagnóstico para investigar el bug del indicador de mensaje que
-// lleva a la ficha equivocada (2026-08-25). Protegido con clave simple porque expone contenido
-// de chats. SE DEBE BORRAR apenas termine el diagnóstico, en el mismo commit que el fix real.
-router.get('/debug/todo', async (req, res) => {
-  try {
-    if (req.query.clave !== 'diag2026alejo') {
-      return res.status(403).json({ error: 'no autorizado' });
-    }
-    const mensajes = await pool.query(
-      `SELECT m.id, m.proyecto_id, pr.nombre AS proyecto_nombre, m.area_id, a.nombre AS area_nombre,
-              m.usuario_id AS remitente_id, ru.nombre AS remitente_nombre,
-              m.destinatario_usuario_id AS destinatario_id, du.nombre AS destinatario_nombre,
-              m.contenido, m.leido, m.created_at
-       FROM mensajes m
-       JOIN proyectos pr ON pr.id = m.proyecto_id
-       LEFT JOIN areas_catalogo a ON a.id = m.area_id
-       LEFT JOIN usuarios ru ON ru.id = m.usuario_id
-       LEFT JOIN usuarios du ON du.id = m.destinatario_usuario_id
-       ORDER BY m.created_at DESC LIMIT 30`
-    );
-    const equipo = await pool.query(
-      `SELECT pe.id, pe.proyecto_id, pr.nombre AS proyecto_nombre, pe.area_id, a.nombre AS area_nombre,
-              pe.usuario_id, u.nombre AS usuario_nombre, pe.pausado
-       FROM proyecto_equipo pe
-       JOIN proyectos pr ON pr.id = pe.proyecto_id
-       JOIN areas_catalogo a ON a.id = pe.area_id
-       LEFT JOIN usuarios u ON u.id = pe.usuario_id
-       ORDER BY pe.id DESC LIMIT 30`
-    );
-    const roles = await pool.query(
-      `SELECT uer.usuario_id, u.nombre, uer.empresa_id, uer.area_id, a.nombre AS area_nombre, uer.estado
-       FROM usuario_empresa_rol uer
-       JOIN areas_catalogo a ON a.id = uer.area_id
-       LEFT JOIN usuarios u ON u.id = uer.usuario_id
-       ORDER BY uer.id DESC LIMIT 30`
-    );
-    res.json({ mensajes: mensajes.rows, equipo: equipo.rows, roles: roles.rows });
-  } catch (error) {
-    console.error('Error en debug/todo:', error);
-    res.status(500).json({ error: error.message });
   }
 });
 
