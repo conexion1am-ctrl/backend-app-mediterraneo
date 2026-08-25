@@ -149,6 +149,48 @@ router.post('/enviar', async (req, res) => {
 // cada mensaje se sigue guardando (ver POST /enviar) para que el roster de cada ficha sea
 // correcto, pero ya no se usa para armar ni filtrar la conversación en sí.
 //
+// 🔴 LISTAR todos los mensajes sin leer dirigidos a un usuario, en toda la app (2026-08-25).
+// Devuelve una fila plana por cada mensaje sin leer, con los datos mínimos para que el frontend
+// arme la cascada de indicadores (Empresas → Proyecto → Actividad → Persona) sin tener que hacer
+// una llamada distinta por cada nivel — se agrupa localmente en cada pantalla.
+//
+// IMPORTANTE — orden de declaración: esta ruta ('/no-leidos/:usuario_id') DEBE ir antes que
+// '/:proyecto_id/:destinatario_usuario_id' de más abajo. Ambas tienen 2 segmentos, y Express hace
+// matching en estricto orden de registro sin priorizar literales sobre parámetros dinámicos — si
+// la ruta genérica quedara primero, CUALQUIER request a /no-leidos/<id> sería interceptado por
+// ella (interpretando "no-leidos" como proyecto_id), devolviendo siempre 400 por falta de
+// mi_usuario_id. Esto ya pasó una vez (2026-08-25, al quitar area_id de la ruta del chat esta
+// pasó de 3 a 2 segmentos e interceptó a esta) y rompió el ícono 💬 de sin-leídos en toda la app
+// sin ningún error visible (axios silenciaba el 400 en el catch de obtenerMensajesSinLeer).
+//
+// No filtramos por proyecto_equipo (asignación): Gerencia, Área Administrativa, Área de
+// Logística y Área Comercial ven TODOS los proyectos de su empresa (verProyectos: 'todos' en
+// utils/roles.js del frontend), no solo los que tienen en proyecto_equipo — así que un mensaje
+// sin leer en un proyecto donde el gerente no está "asignado" igual debe contar para él si es de
+// su empresa. Por eso este endpoint no cruza con proyecto_equipo: trae TODO lo sin leer dirigido
+// a mí, y es el FRONTEND quien decide, pantalla por pantalla, si ese proyecto/área es visible
+// para el área de quien está mirando (mismo criterio que ya usan ProyectosScreen/AreaProyectoScreen
+// hoy para decidir qué mostrar).
+router.get('/no-leidos/:usuario_id', async (req, res) => {
+  try {
+    const { usuario_id } = req.params;
+    const result = await pool.query(
+      `SELECT m.id, m.proyecto_id, m.area_id, m.usuario_id AS remitente_usuario_id,
+              p.empresa_id
+       FROM mensajes m
+       JOIN proyectos p ON p.id = m.proyecto_id
+       WHERE m.destinatario_usuario_id = $1 AND m.leido = false`,
+      [usuario_id]
+    );
+    res.json({ total: result.rows.length, sinLeer: result.rows });
+  } catch (error) {
+    console.error('Error listando mensajes sin leer:', error);
+    res.status(500).json({ error: 'Error al listar mensajes sin leer' });
+  }
+});
+
+// 👁️ VER la conversación individual con una persona específica, dentro de un proyecto.
+//
 // "mi_usuario_id" (query param obligatorio): el usuario_id de quien está pidiendo el chat (el
 // que está mirando la pantalla). ANTES este endpoint solo filtraba por destinatario_usuario_id
 // = el OTRO participante, sin comparar nunca contra quién soy yo — eso traía "todos los mensajes
@@ -327,37 +369,6 @@ router.delete('/vaciar/:proyecto_id/:usuario_a/:usuario_b', async (req, res) => 
     res.status(500).json({ error: 'Error al vaciar el chat' });
   } finally {
     client.release();
-  }
-});
-
-// 🔴 LISTAR todos los mensajes sin leer dirigidos a un usuario, en toda la app (2026-08-25).
-// Devuelve una fila plana por cada mensaje sin leer, con los datos mínimos para que el frontend
-// arme la cascada de indicadores (Empresas → Proyecto → Actividad → Persona) sin tener que hacer
-// una llamada distinta por cada nivel — se agrupa localmente en cada pantalla.
-//
-// No filtramos por proyecto_equipo (asignación): Gerencia, Área Administrativa, Área de
-// Logística y Área Comercial ven TODOS los proyectos de su empresa (verProyectos: 'todos' en
-// utils/roles.js del frontend), no solo los que tienen en proyecto_equipo — así que un mensaje
-// sin leer en un proyecto donde el gerente no está "asignado" igual debe contar para él si es de
-// su empresa. Por eso este endpoint no cruza con proyecto_equipo: trae TODO lo sin leer dirigido
-// a mí, y es el FRONTEND quien decide, pantalla por pantalla, si ese proyecto/área es visible
-// para el área de quien está mirando (mismo criterio que ya usan ProyectosScreen/AreaProyectoScreen
-// hoy para decidir qué mostrar).
-router.get('/no-leidos/:usuario_id', async (req, res) => {
-  try {
-    const { usuario_id } = req.params;
-    const result = await pool.query(
-      `SELECT m.id, m.proyecto_id, m.area_id, m.usuario_id AS remitente_usuario_id,
-              p.empresa_id
-       FROM mensajes m
-       JOIN proyectos p ON p.id = m.proyecto_id
-       WHERE m.destinatario_usuario_id = $1 AND m.leido = false`,
-      [usuario_id]
-    );
-    res.json({ total: result.rows.length, sinLeer: result.rows });
-  } catch (error) {
-    console.error('Error listando mensajes sin leer:', error);
-    res.status(500).json({ error: 'Error al listar mensajes sin leer' });
   }
 });
 
