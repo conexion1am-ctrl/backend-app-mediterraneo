@@ -286,6 +286,25 @@ async function aplicarMigraciones() {
       clienteLock.release();
     }
 
+    // Documentos totalmente editables (2026-08-25): antes, el texto de la cotización (saludo,
+    // párrafo de contexto) y TODAS las cláusulas legales del contrato vivían fijas en el código
+    // del servidor (generarPdf.js) — nadie podía tocarlas sin pedirle un cambio de código al
+    // desarrollador. Ahora cada cotización/contrato guarda su PROPIA copia editable de ese texto,
+    // precargada con el estándar de la empresa al crearse, para que el usuario pueda revisar y
+    // modificar cualquier palabra (incluidas las cláusulas legales) antes de generar el PDF final,
+    // sin afectar a otras cotizaciones/contratos ya existentes ni a los que se creen después.
+    await pool.query(`ALTER TABLE cotizaciones ADD COLUMN IF NOT EXISTS saludo TEXT`);
+    // clausulas: array JSON de { titulo, texto } — el contrato de obra completo, cláusula por
+    // cláusula, editable de forma independiente en cada contrato. Se precarga con el texto
+    // estándar (ver CLAUSULAS_DEFECTO en cotizaciones_v2.js) al aceptar una cotización.
+    await pool.query(`ALTER TABLE contratos ADD COLUMN IF NOT EXISTS clausulas JSONB`);
+    await pool.query(`ALTER TABLE contratos ADD COLUMN IF NOT EXISTS parrafo_introductorio TEXT`);
+    await pool.query(`ALTER TABLE contratos ADD COLUMN IF NOT EXISTS condiciones_pago JSONB`);
+    await pool.query(`ALTER TABLE contratos ADD COLUMN IF NOT EXISTS tiempo_entrega VARCHAR(255)`);
+    await pool.query(`ALTER TABLE contratos ADD COLUMN IF NOT EXISTS ciudad VARCHAR(255)`);
+    await pool.query(`ALTER TABLE contratos ADD COLUMN IF NOT EXISTS firmante VARCHAR(255)`);
+    await pool.query(`ALTER TABLE contratos ADD COLUMN IF NOT EXISTS numero VARCHAR(50)`);
+
     console.log('✅ Esquema verificado/actualizado correctamente');
   } catch (error) {
     // No tumbamos el servidor si esto falla: preferimos que la app siga funcionando con el

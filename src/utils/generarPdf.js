@@ -10,6 +10,97 @@ const formatearMoneda = (valor) => {
   return numero.toLocaleString('es-CO', { style: 'currency', currency: 'COP', maximumFractionDigits: 0 });
 };
 
+// Convierte un número entero (pesos colombianos) a su forma en letras, en español, para el
+// bloque "Segunda - Precio" del contrato: "$87.500.000 (Ochenta y siete millones quinientos mil
+// pesos colombianos)". Cubre el rango que puede necesitar un contrato de obra (hasta miles de
+// millones); no pretende ser un conversor genérico de propósito general.
+const UNIDADES = ['', 'uno', 'dos', 'tres', 'cuatro', 'cinco', 'seis', 'siete', 'ocho', 'nueve'];
+const DIEZ_A_DIECINUEVE = ['diez', 'once', 'doce', 'trece', 'catorce', 'quince', 'dieciséis', 'diecisiete', 'dieciocho', 'diecinueve'];
+// 20-29 en español van pegados ("veintiuno", "veintidós"...), a diferencia de 30 en adelante
+// ("treinta y uno", "cuarenta y dos"...) que van separados con "y".
+const VEINTIALGO = ['veinte', 'veintiuno', 'veintidós', 'veintitrés', 'veinticuatro', 'veinticinco', 'veintiséis', 'veintisiete', 'veintiocho', 'veintinueve'];
+const DECENAS = ['', '', 'veinte', 'treinta', 'cuarenta', 'cincuenta', 'sesenta', 'setenta', 'ochenta', 'noventa'];
+const CENTENAS = ['', 'ciento', 'doscientos', 'trescientos', 'cuatrocientos', 'quinientos', 'seiscientos', 'setecientos', 'ochocientos', 'novecientos'];
+
+function trescientosALetras(n) {
+  if (n === 0) return '';
+  if (n === 100) return 'cien';
+  let texto = '';
+  const c = Math.floor(n / 100);
+  const resto = n % 100;
+  if (c > 0) texto += CENTENAS[c];
+  if (resto > 0) {
+    if (texto) texto += ' ';
+    if (resto < 10) {
+      texto += UNIDADES[resto];
+    } else if (resto < 20) {
+      texto += DIEZ_A_DIECINUEVE[resto - 10];
+    } else if (resto < 30) {
+      texto += VEINTIALGO[resto - 20];
+    } else {
+      const d = Math.floor(resto / 10);
+      const u = resto % 10;
+      texto += DECENAS[d];
+      if (u > 0) texto += ` y ${UNIDADES[u]}`;
+    }
+  }
+  return texto;
+}
+
+// La forma apocopada "un/veintiún" (sin la "o" final) se usa cuando "uno" antecede directamente
+// a un sustantivo masculino como "millones" o "mil" (ej. "veintiún millones", "treinta y un
+// millones" — nunca "veintiuno millones" ni "treinta y uno millones"). Cubre tanto "uno" pegado
+// (veintiuno → veintiún) como "y uno" separado (treinta y uno → treinta y un).
+function conApocope(n) {
+  const texto = trescientosALetras(n);
+  if (n % 10 !== 1 || n === 1) return texto;
+  return texto.endsWith('y uno') ? texto.replace(/y uno$/, 'y un') : texto.replace(/uno$/, 'ún');
+}
+
+// trescientosALetras/conApocope solo saben convertir bloques de 0-999. Los "millones" pueden
+// superar 999 en montos de mil millones de pesos o más (poco común en un contrato de obra, pero
+// posible), lo que antes rompía la función y llegaba a imprimir "Undefined" en el PDF del
+// contrato. Esta función descompone CUALQUIER cantidad de millones en sus propios "miles de
+// millones" + "millones" antes de convertirlos, igual que ya se hace con miles/centenas.
+function bloqueDeMillonesALetras(millones) {
+  if (millones < 1000) return conApocope(millones);
+  const milesDeMillones = Math.floor(millones / 1000);
+  const restoMillones = millones % 1000;
+  const partes = [];
+  partes.push(milesDeMillones === 1 ? 'mil' : `${conApocope(milesDeMillones)} mil`);
+  if (restoMillones > 0) partes.push(conApocope(restoMillones));
+  return partes.join(' ');
+}
+
+function numeroALetras(valor) {
+  let n = Math.round(Math.abs(parseFloat(valor) || 0));
+  if (n === 0) return 'cero pesos colombianos';
+
+  const millones = Math.floor(n / 1000000);
+  const miles = Math.floor((n % 1000000) / 1000);
+  const centenas = n % 1000;
+
+  const partes = [];
+  if (millones > 0) {
+    partes.push(millones === 1 ? 'un millón' : `${bloqueDeMillonesALetras(millones)} millones`);
+  }
+  if (miles > 0) {
+    partes.push(miles === 1 ? 'mil' : `${conApocope(miles)} mil`);
+  }
+  if (centenas > 0) {
+    partes.push(trescientosALetras(centenas));
+  }
+
+  let texto = partes.join(' ').trim();
+  texto = texto.charAt(0).toUpperCase() + texto.slice(1);
+  // "de pesos" solo aplica cuando el número es un múltiplo exacto de un millón (ej. "dos
+  // millones de pesos"); si hay miles o centenas de por medio no lleva "de" (ej. "un millón
+  // quinientos mil pesos", como en el ejemplo real del usuario: "ochenta y siete millones
+  // quinientos mil pesos colombianos").
+  const conector = millones > 0 && miles === 0 && centenas === 0 ? ' de' : '';
+  return `${texto}${conector} pesos colombianos`;
+}
+
 const formatearFechaDdMmAa = (fecha) => {
   if (!fecha) return '';
   const d = new Date(fecha);
@@ -74,7 +165,7 @@ function parsearCondicionesPago(condicionesPago) {
 
 function construirHtmlCotizacion({
   empresa, cliente, numero, fecha, items, total, fechaEntrega,
-  ciudad, propietario, parrafo, descuento, condicionesPago, tiempoEntrega, firmante,
+  ciudad, propietario, saludo, parrafo, descuento, condicionesPago, tiempoEntrega, firmante,
 }) {
   const colorEmpresa = empresa?.color_hex || '#1E90FF';
   const grupos = agruparPorSeccion(items);
@@ -158,7 +249,7 @@ function construirHtmlCotizacion({
 
       <p>Señor(a)<br/>${propietario || cliente?.nombre || ''}${cliente?.nombre_proyecto ? `<br/>${cliente.nombre_proyecto}` : ''}</p>
 
-      <p>Cordial saludo:</p>
+      <p>${saludo || 'Cordial Saludo:'}</p>
 
       ${parrafo ? `<p>${parrafo}</p>` : ''}
 
@@ -206,59 +297,67 @@ function construirHtmlCotizacion({
 
 // Texto legal fijo y genérico (mismas cláusulas para todas las empresas), con marcadores
 // {{ORDENANTE}} / {{CONTRATISTA}} que se reemplazan según el caso.
-function clausulasLegales({ ciudad, fechaLarga }) {
+// 2026-08-25: las cláusulas ya NO son texto fijo — cada contrato guarda su propio array editable
+// (ver contratos.clausulas, precargado con CLAUSULAS_DEFECTO en cotizaciones_v2.js). Esta función
+// solo arma el HTML a partir de lo que venga guardado; si por algún motivo un contrato viejo no
+// tiene clausulas (creado antes de este cambio), simplemente no se imprime esa sección en vez de
+// fallar. La cláusula "Segunda - Precio" recibe además, en su propio párrafo aparte, el valor
+// total en números y en letras entre paréntesis — a pedido explícito del usuario.
+function parsearClausulas(clausulas) {
+  if (Array.isArray(clausulas)) return clausulas;
+  if (typeof clausulas === 'string') {
+    try {
+      const parsed = JSON.parse(clausulas);
+      return Array.isArray(parsed) ? parsed : [];
+    } catch {
+      return [];
+    }
+  }
+  return [];
+}
+
+function clausulasLegalesHtml({ clausulas, total, ciudad, fechaLarga }) {
+  const lista = parsearClausulas(clausulas);
+  const esSegundaPrecio = (titulo) => /segunda/i.test(titulo || '') && /precio/i.test(titulo || '');
+
+  const bloques = lista
+    .map((c) => {
+      const textoConSaltos = (c.texto || '').replace(/\n/g, '<br/>');
+      const valorEnLetras = esSegundaPrecio(c.titulo) && total != null
+        ? `<br/>${formatearMoneda(total)} (${numeroALetras(total)})`
+        : '';
+      return `<p><strong>${c.titulo || ''}.</strong> ${textoConSaltos}${valorEnLetras}</p>`;
+    })
+    .join('\n');
+
   return `
-    <p><strong>Primera - Objeto.</strong> La CONTRATISTA se obliga a realizar y producir y el ORDENANTE a pagar los trabajos y objetos especificados en este contrato que consta de la tabla de ítems relacionada a continuación.</p>
-
-    <p><strong>Segunda - Precio.</strong> El ORDENANTE pagará a la CONTRATISTA acorde con el volumen de trabajos realmente realizados los valores relacionados en el presente contrato.</p>
-
-    <p><strong>Tercera - Pago.</strong> El ORDENANTE pagará a la CONTRATISTA los dineros que deba en razón a las entregas que efectivamente ésta realice, estipulándose el modo de pago según las condiciones de pago relacionadas en este documento. En caso de que se haga entrega de dinero o valores por encima del monto establecido, estos se abonarán al pago final. Los costos planteados en el presente documento corresponden al total de los trabajos a realizar. Se debe tomar en cuenta que, si se agregan elementos, aumentan cantidad de bienes a suministrar, estos se informarán y cobrarán aparte después de previa aprobación por escrito por parte del ORDENANTE.</p>
-
-    <p><strong>Cuarta - Entrega.</strong> La CONTRATISTA realizará la entrega de los trabajos según el plazo acordado, concretándose a la firma del presente documento y el respectivo abono inicial.</p>
-
-    <p><strong>Quinta - Procedimiento para la entrega.</strong> La CONTRATISTA hará el procedimiento para la entrega de los trabajos en el domicilio del ORDENANTE. El ORDENANTE dispondrá de 10 días hábiles, contados a partir de la entrega de los trabajos para formular los reclamos que procedan debido a las diferencias que exhiba respecto de los trabajos contratados.</p>
-
-    <p><strong>Sexta - Materia Prima.</strong><br/>
-    a) La materia prima será suministrada por la CONTRATISTA de lo que este haya acordado.<br/>
-    b) Los desperdicios corresponderán a la CONTRATISTA de lo que este haya suministrado.</p>
-
-    <p><strong>Séptima - Duración.</strong> El contrato que consta en este escrito tiene una duración igual a la entrega del total de los trabajos. Para terminarlo, cualquiera de las partes podrá comunicar a la otra con una anticipación mínima de quince (15) días su intención de cesar su vínculo contractual, en tal caso, ORDENANTE y CONTRATISTA quedan obligados a cumplir con las obligaciones derivadas de los trabajos contratados con anterioridad al preaviso.</p>
-
-    <p><strong>Octava - Obligaciones de la CONTRATISTA.</strong> Constituyen las principales obligaciones de la CONTRATISTA las siguientes:<br/>
-    a. Realizar los trabajos objeto del presente contrato según las especificaciones acordadas.<br/>
-    b. Realizar las entregas dentro del plazo acordado para tal efecto.<br/>
-    c. Tomar las medidas de protección necesarias para proteger los elementos ya instalados en el inmueble.<br/>
-    d. En caso de ocasionar daños estos se repararán y cambiarán para dejarlos en estado original.<br/>
-    e. No se responderá por daños que existan previamente, establecidos por chequeo visual previo y documentado fotográficamente, la fachada externa de la puerta de ingreso no es susceptible a reclamaciones.<br/>
-    f. En caso de requerirse arreglos fuera de este contrato por desperfectos preexistentes, deberán solicitarse al ORDENANTE y tendrán un valor adicional.<br/>
-    g. Pagar cuando corresponda o hacer la verificación de los aportes a la Seguridad Social de cada uno de los empleados que ingresan a la obra; en ningún momento el ORDENANTE genera vínculo laboral ni se obliga a hacer reservas para dichos aportes.<br/>
-    h. Entregar la obra con aseo, retirar todos los escombros y de la correcta disposición de estos.</p>
-
-    <p><strong>Novena - Obligaciones especiales del ORDENANTE.</strong> Constituyen las obligaciones principales del ORDENANTE las siguientes:<br/>
-    a. Pagar los precios dentro del plazo previsto.<br/>
-    b. Recibir los trabajos que le entregue la CONTRATISTA, cuando tal hecho esté conforme con los términos definidos en esta convención y a los diseños previamente aprobados.<br/>
-    c. Avisar oportunamente de requerimientos especiales para el ingreso al inmueble.<br/>
-    d. Autorizar al personal que indique la CONTRATISTA en caso de ser requerido.<br/>
-    e. Informar oportunamente de suspensión de agua o energía en el inmueble.<br/>
-    f. Responder oportunamente las dudas que le presente la CONTRATISTA, así mismo tomar decisiones oportunas de la elección de materiales, diseños y colores.</p>
-
-    <p><strong>Décima - Garantía.</strong> Un año en mano de obra; en materiales, cada proveedor determina la garantía de su producto, la CONTRATISTA gestiona la garantía y su cubrimiento por parte del proveedor de los materiales que sean suministrados por la empresa.</p>
-
-    <p><strong>Undécima - Cláusula de indemnidad.</strong> La CONTRATISTA se obliga a mantener indemne al ORDENANTE de cualquier daño o perjuicio originado en reclamaciones de terceros que tengan como causa sus actuaciones hasta por el monto del daño o perjuicio causado. La CONTRATISTA mantendrá indemne al ORDENANTE por cualquier obligación de carácter laboral o relacionado que se origine en el incumplimiento de las obligaciones laborales o de la seguridad social que la CONTRATISTA asume frente al personal, subordinados, empleados o terceros que se vinculen a la ejecución de las obligaciones derivadas del presente Contrato.</p>
-
-    <p><strong>Duodécima - Cláusula compromisoria.</strong> Toda controversia o diferencia relativa a este contrato y a su ejecución o liquidación, se resolverá por un tribunal de Arbitramento designado por la cámara de comercio del domicilio de la CONTRATISTA mediante sorteo entre los árbitros inscritos en las listas que se lleva dicha cámara. El tribunal así constituido se sujetará a lo dispuesto por el Decreto 2279/89 y las demás disposiciones legales que lo modifiquen o adicionen, de acuerdo con las siguientes reglas:<br/>
-    a. El tribunal estará integrado por un árbitro.<br/>
-    b. La organización interna del tribunal se sujetará a las reglas previstas para el efecto por el centro de arbitraje de la cámara de comercio correspondiente.<br/>
-    c. El tribunal decidirá en derecho.<br/>
-    d. El tribunal funcionará en el centro de arbitraje de la Cámara de Comercio de su domicilio.</p>
+    ${bloques}
 
     <p>En señal de conformidad las partes contratantes suscriben el presente documento${ciudad ? ` en la Ciudad de ${ciudad}` : ''} siendo el día ${fechaLarga}. Se extienden dos copias del mismo tenor y valor.</p>
   `;
 }
 
+// Reemplaza los marcadores {{...}} del párrafo introductorio editable (ver
+// PARRAFO_INTRODUCTORIO_DEFECTO en cotizaciones_v2.js) por los datos reales del cliente/empresa,
+// igual que antes se armaba ese párrafo a mano, pero ahora el TEXTO ALREDEDOR de esos datos es
+// editable por el usuario en la pantalla de revisión sin tener que volver a escribir los datos.
+function armarParrafoIntroductorio({ plantilla, cliente, empresa, firmante, direccionInmueble, mts2Texto, nombreProyecto }) {
+  if (!plantilla) return '';
+  return plantilla
+    .replace('{{ORDENANTE_NOMBRE}}', cliente?.nombre || 'el ORDENANTE')
+    .replace('{{ORDENANTE_CEDULA}}', cliente?.cedula ? `, quién se identifica con la cédula de ciudadanía ${cliente.cedula}` : '')
+    .replace('{{FIRMANTE}}', firmante || 'el representante de la CONTRATISTA')
+    .replace('{{FIRMANTE_CEDULA}}', empresa?.cedula_representante ? `, quién se identifica con la cédula de ciudadanía ${empresa.cedula_representante}` : '')
+    .replace('{{EMPRESA_NOMBRE}}', empresa?.nombre || 'la empresa')
+    .replace('{{EMPRESA_NIT}}', empresa?.nit ? ` con NIT: ${empresa.nit}` : '')
+    .replace('{{PROYECTO_NOMBRE}}', nombreProyecto ? ` en ${nombreProyecto}` : '')
+    .replace('{{DIRECCION_INMUEBLE}}', direccionInmueble ? ` ubicado en ${direccionInmueble}` : '')
+    .replace('{{MTS2}}', mts2Texto || '');
+}
+
 function construirHtmlContrato({
   empresa, cliente, numero, fecha, items, total, fechaEntrega,
-  ciudad, condicionesPago, tiempoEntrega, firmante,
+  ciudad, parrafoIntroductorio, clausulas, condicionesPago, tiempoEntrega, firmante,
 }) {
   const colorEmpresa = empresa?.color_hex || '#1E90FF';
   const grupos = agruparPorSeccion(items);
@@ -267,6 +366,7 @@ function construirHtmlContrato({
   const fechaContrato = fecha || new Date();
   const direccionInmueble = cliente?.direccion ? `${cliente.direccion}` : '';
   const mts2Texto = cliente?.mts2 ? ` (${cliente.mts2} m²)` : '';
+  const totalContrato = total != null ? total : subtotalGeneral;
 
   const filaItem = (item, index) => `
     <tr style="background:${index % 2 === 0 ? '#fff' : '#f7f7f7'};">
@@ -349,7 +449,11 @@ function construirHtmlContrato({
         <p>Fecha: ${formatearFechaDdMmAa(fechaContrato)}</p>
       </div>
 
-      <p>Entre ${cliente?.nombre || 'el ORDENANTE'}${cliente?.cedula ? `, quién se identifica con la cédula de ciudadanía ${cliente.cedula}` : ''}, quién para los efectos del presente contrato se denominará simplemente como el ORDENANTE y ${firmante || 'el representante de la CONTRATISTA'}${empresa?.cedula_representante ? `, quién se identifica con la cédula de ciudadanía ${empresa.cedula_representante}` : ''}, quién actúa en representación de ${empresa?.nombre || 'la empresa'}${empresa?.nit ? ` con NIT: ${empresa.nit}` : ''}, y en lo sucesivo se denominará como la CONTRATISTA, hemos decidido celebrar el contrato de obra civil y reformas que tendrán lugar${cliente?.nombre_proyecto ? ` en ${cliente.nombre_proyecto}` : ''}${direccionInmueble ? ` ubicado en ${direccionInmueble}` : ''}${mts2Texto}; que consta en el documento que ahora se suscribe y que se rige por las cláusulas que se enuncian y en lo previsto en ellas por las disposiciones legales aplicables a la materia de la que trata este acto jurídico.</p>
+      <p>${armarParrafoIntroductorio({
+        plantilla: parrafoIntroductorio,
+        cliente, empresa, firmante, direccionInmueble, mts2Texto,
+        nombreProyecto: cliente?.nombre_proyecto,
+      })}</p>
 
       ${tablasSecciones}
 
@@ -357,7 +461,7 @@ function construirHtmlContrato({
         <tbody>
           <tr class="totalGeneral">
             <td class="etiqueta">TOTAL</td>
-            <td class="monto">${formatearMoneda(total != null ? total : subtotalGeneral)}</td>
+            <td class="monto">${formatearMoneda(totalContrato)}</td>
           </tr>
         </tbody>
       </table>
@@ -374,7 +478,7 @@ function construirHtmlContrato({
       <p>Los dineros deben ser consignados a la Cuenta ${empresa.banco_tipo_cuenta || ''} de ${empresa.banco_nombre || ''} <strong>${empresa.banco_numero}</strong> a nombre de <strong>${empresa.banco_titular || empresa.nombre || ''}</strong>.</p>` : ''}
 
       <div class="clausulas">
-        ${clausulasLegales({ ciudad, fechaLarga: formatearFechaLarga(fechaContrato) })}
+        ${clausulasLegalesHtml({ clausulas, total: totalContrato, ciudad, fechaLarga: formatearFechaLarga(fechaContrato) })}
       </div>
 
       <div class="firmas">

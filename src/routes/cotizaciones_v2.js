@@ -15,7 +15,11 @@ const pool = new Pool({
 // Valores por defecto de los campos "estándar" de la carta (editables por el usuario al crear
 // la cotización, pero precargados para no empezar desde cero cada vez).
 const PARRAFO_CONTEXTO_DEFECTO = 'Por solicitud efectuada paso a cotizar los precios del Kit de acabados completos para su casa';
-const TIEMPO_ENTREGA_DEFECTO = '12 - 14 Semanas';
+// 2026-08-25: a pedido del usuario, el tiempo de entrega ya NO trae un rango de semanas fijo
+// como sugerencia — nace en "00 - 00 Semanas" para que sea evidente que hay que llenarlo, en vez
+// de arriesgarse a que alguien olvide cambiar un valor de ejemplo y lo deje mal en el documento.
+const TIEMPO_ENTREGA_DEFECTO = '00 - 00 Semanas';
+const SALUDO_DEFECTO = 'Cordial Saludo:';
 const CONDICIONES_PAGO_DEFECTO = [
   { porcentaje: 25, descripcion: 'A la firma del contrato para el inicio de actividades' },
   { porcentaje: 25, descripcion: 'A las 3-4 semanas con avance' },
@@ -23,13 +27,39 @@ const CONDICIONES_PAGO_DEFECTO = [
   { porcentaje: 25, descripcion: 'A la entrega final de la obra, incluyendo carpintería' },
 ];
 
+// Cláusulas legales estándar del contrato de obra (2026-08-25): antes vivían fijas en
+// generarPdf.js sin que nadie pudiera tocarlas desde la app. Ahora son solo el PUNTO DE PARTIDA
+// con el que nace cada contrato nuevo — cada contrato guarda su PROPIA copia editable en
+// contratos.clausulas (JSONB), así que modificar una acá no afecta contratos ya creados, y
+// modificar un contrato ya creado no afecta a los que se creen después.
+const CLAUSULAS_DEFECTO = [
+  { titulo: 'Primera - Objeto', texto: 'La CONTRATISTA se obliga a realizar y producir y el ORDENANTE a pagar los trabajos y objetos especificados en este contrato que consta de la tabla de ítems relacionada a continuación.' },
+  { titulo: 'Segunda - Precio', texto: 'El ORDENANTE pagará a la CONTRATISTA acorde con el volumen de trabajos realmente realizados los valores relacionados en el presente contrato.' },
+  { titulo: 'Tercera - Pago', texto: 'El ORDENANTE pagará a la CONTRATISTA los dineros que deba en razón a las entregas que efectivamente ésta realice, estipulándose el modo de pago según las condiciones de pago relacionadas en este documento. En caso de que se haga entrega de dinero o valores por encima del monto establecido, estos se abonarán al pago final. Los costos planteados en el presente documento corresponden al total de los trabajos a realizar. Se debe tomar en cuenta que, si se agregan elementos, aumentan cantidad de bienes a suministrar, estos se informarán y cobrarán aparte después de previa aprobación por escrito por parte del ORDENANTE.' },
+  { titulo: 'Cuarta - Entrega', texto: 'La CONTRATISTA realizará la entrega de los trabajos según el plazo acordado, concretándose a la firma del presente documento y el respectivo abono inicial.' },
+  { titulo: 'Quinta - Procedimiento para la entrega', texto: 'La CONTRATISTA hará el procedimiento para la entrega de los trabajos en el domicilio del ORDENANTE. El ORDENANTE dispondrá de 10 días hábiles, contados a partir de la entrega de los trabajos para formular los reclamos que procedan debido a las diferencias que exhiba respecto de los trabajos contratados.' },
+  { titulo: 'Sexta - Materia Prima', texto: 'a) La materia prima será suministrada por la CONTRATISTA de lo que este haya acordado.\nb) Los desperdicios corresponderán a la CONTRATISTA de lo que este haya suministrado.' },
+  { titulo: 'Séptima - Duración', texto: 'El contrato que consta en este escrito tiene una duración igual a la entrega del total de los trabajos. Para terminarlo, cualquiera de las partes podrá comunicar a la otra con una anticipación mínima de quince (15) días su intención de cesar su vínculo contractual, en tal caso, ORDENANTE y CONTRATISTA quedan obligados a cumplir con las obligaciones derivadas de los trabajos contratados con anterioridad al preaviso.' },
+  { titulo: 'Octava - Obligaciones de la CONTRATISTA', texto: 'Constituyen las principales obligaciones de la CONTRATISTA las siguientes:\na. Realizar los trabajos objeto del presente contrato según las especificaciones acordadas.\nb. Realizar las entregas dentro del plazo acordado para tal efecto.\nc. Tomar las medidas de protección necesarias para proteger los elementos ya instalados en el inmueble.\nd. En caso de ocasionar daños estos se repararán y cambiarán para dejarlos en estado original.\ne. No se responderá por daños que existan previamente, establecidos por chequeo visual previo y documentado fotográficamente, la fachada externa de la puerta de ingreso no es susceptible a reclamaciones.\nf. En caso de requerirse arreglos fuera de este contrato por desperfectos preexistentes, deberán solicitarse al ORDENANTE y tendrán un valor adicional.\ng. Pagar cuando corresponda o hacer la verificación de los aportes a la Seguridad Social de cada uno de los empleados que ingresan a la obra; en ningún momento el ORDENANTE genera vínculo laboral ni se obliga a hacer reservas para dichos aportes.\nh. Entregar la obra con aseo, retirar todos los escombros y de la correcta disposición de estos.' },
+  { titulo: 'Novena - Obligaciones especiales del ORDENANTE', texto: 'Constituyen las obligaciones principales del ORDENANTE las siguientes:\na. Pagar los precios dentro del plazo previsto.\nb. Recibir los trabajos que le entregue la CONTRATISTA, cuando tal hecho esté conforme con los términos definidos en esta convención y a los diseños previamente aprobados.\nc. Avisar oportunamente de requerimientos especiales para el ingreso al inmueble.\nd. Autorizar al personal que indique la CONTRATISTA en caso de ser requerido.\ne. Informar oportunamente de suspensión de agua o energía en el inmueble.\nf. Responder oportunamente las dudas que le presente la CONTRATISTA, así mismo tomar decisiones oportunas de la elección de materiales, diseños y colores.' },
+  { titulo: 'Décima - Garantía', texto: 'Un año en mano de obra; en materiales, cada proveedor determina la garantía de su producto, la CONTRATISTA gestiona la garantía y su cubrimiento por parte del proveedor de los materiales que sean suministrados por la empresa.' },
+  { titulo: 'Undécima - Cláusula de indemnidad', texto: 'La CONTRATISTA se obliga a mantener indemne al ORDENANTE de cualquier daño o perjuicio originado en reclamaciones de terceros que tengan como causa sus actuaciones hasta por el monto del daño o perjuicio causado. La CONTRATISTA mantendrá indemne al ORDENANTE por cualquier obligación de carácter laboral o relacionado que se origine en el incumplimiento de las obligaciones laborales o de la seguridad social que la CONTRATISTA asume frente al personal, subordinados, empleados o terceros que se vinculen a la ejecución de las obligaciones derivadas del presente Contrato.' },
+  { titulo: 'Duodécima - Cláusula compromisoria', texto: 'Toda controversia o diferencia relativa a este contrato y a su ejecución o liquidación, se resolverá por un tribunal de Arbitramento designado por la cámara de comercio del domicilio de la CONTRATISTA mediante sorteo entre los árbitros inscritos en las listas que se lleva dicha cámara. El tribunal así constituido se sujetará a lo dispuesto por el Decreto 2279/89 y las demás disposiciones legales que lo modifiquen o adicionen, de acuerdo con las siguientes reglas:\na. El tribunal estará integrado por un árbitro.\nb. La organización interna del tribunal se sujetará a las reglas previstas para el efecto por el centro de arbitraje de la cámara de comercio correspondiente.\nc. El tribunal decidirá en derecho.\nd. El tribunal funcionará en el centro de arbitraje de la Cámara de Comercio de su domicilio.' },
+];
+
+// Párrafo introductorio "Entre X y Y..." — también editable por contrato, precargado con los
+// marcadores {{...}} que generarPdf.js reemplaza por los datos reales (cliente, empresa, etc.)
+// al momento de generar el PDF, para que el usuario pueda editar el texto alrededor sin tener
+// que volver a escribir los datos que ya se llenan solos.
+const PARRAFO_INTRODUCTORIO_DEFECTO = 'Entre {{ORDENANTE_NOMBRE}}{{ORDENANTE_CEDULA}}, quién para los efectos del presente contrato se denominará simplemente como el ORDENANTE y {{FIRMANTE}}{{FIRMANTE_CEDULA}}, quién actúa en representación de {{EMPRESA_NOMBRE}}{{EMPRESA_NIT}}, y en lo sucesivo se denominará como la CONTRATISTA, hemos decidido celebrar el contrato de obra civil y reformas que tendrán lugar{{PROYECTO_NOMBRE}}{{DIRECCION_INMUEBLE}}{{MTS2}}; que consta en el documento que ahora se suscribe y que se rige por las cláusulas que se enuncian y en lo previsto en ellas por las disposiciones legales aplicables a la materia de la que trata este acto jurídico.';
+
 // 📝 CREAR cotización con sus ítems
 router.post('/crear', async (req, res) => {
   const client = await pool.connect();
   try {
     const {
       empresa_id, cliente_id, proyecto_id, numero, items, descuento,
-      propietario, ciudad, parrafo_contexto, condiciones_pago, tiempo_entrega, firmante,
+      propietario, ciudad, saludo, parrafo_contexto, condiciones_pago, tiempo_entrega, firmante,
     } = req.body;
 
     if (!empresa_id || !cliente_id || !items || items.length === 0) {
@@ -44,11 +74,12 @@ router.post('/crear', async (req, res) => {
     const cotizacionResult = await client.query(
       `INSERT INTO cotizaciones
         (empresa_id, cliente_id, proyecto_id, numero, total, descuento,
-         propietario, ciudad, parrafo_contexto, condiciones_pago, tiempo_entrega, firmante)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) RETURNING *`,
+         propietario, ciudad, saludo, parrafo_contexto, condiciones_pago, tiempo_entrega, firmante)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13) RETURNING *`,
       [
         empresa_id, cliente_id, proyecto_id || null, numero || null, total, parseFloat(descuento) || 0,
         propietario || null, ciudad || null,
+        saludo || SALUDO_DEFECTO,
         parrafo_contexto || PARRAFO_CONTEXTO_DEFECTO,
         JSON.stringify(condiciones_pago && condiciones_pago.length ? condiciones_pago : CONDICIONES_PAGO_DEFECTO),
         tiempo_entrega || TIEMPO_ENTREGA_DEFECTO,
@@ -154,13 +185,29 @@ router.post('/:id/aceptar', async (req, res) => {
 
     // El contrato nace SIN proyecto_id: el proyecto se crea después, a demanda, desde la
     // pantalla de Contratos. Guardamos aquí el snapshot con el que se creará ese proyecto.
+    //
+    // El contrato nace con su PROPIA copia editable del texto legal (clausulas, párrafo
+    // introductorio, condiciones de pago, tiempo de entrega, ciudad, firmante, número) —
+    // precargada con el texto estándar (CLAUSULAS_DEFECTO) y con lo que ya se había llenado en
+    // la cotización, pero a partir de aquí es independiente: editar el contrato ya NO modifica
+    // la cotización de la que nació, ni viceversa.
     const contratoResult = await client.query(
       `INSERT INTO contratos
         (cotizacion_id, empresa_id, proyecto_id, fecha_entrega, valor_total,
-         proyecto_nombre_snapshot, proyecto_direccion_snapshot, proyecto_mts2_snapshot)
-       VALUES ($1, $2, NULL, $3, $4, $5, $6, $7) RETURNING *`,
-      [id, cotizacion.empresa_id, fecha_entrega || null, cotizacion.total,
-       nombreProyecto, cliente?.direccion || null, cliente?.mts2 || null]
+         proyecto_nombre_snapshot, proyecto_direccion_snapshot, proyecto_mts2_snapshot,
+         clausulas, parrafo_introductorio, condiciones_pago, tiempo_entrega, ciudad, firmante, numero)
+       VALUES ($1, $2, NULL, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14) RETURNING *`,
+      [
+        id, cotizacion.empresa_id, fecha_entrega || null, cotizacion.total,
+        nombreProyecto, cliente?.direccion || null, cliente?.mts2 || null,
+        JSON.stringify(CLAUSULAS_DEFECTO),
+        PARRAFO_INTRODUCTORIO_DEFECTO,
+        cotizacion.condiciones_pago,
+        cotizacion.tiempo_entrega || TIEMPO_ENTREGA_DEFECTO,
+        cotizacion.ciudad || null,
+        cotizacion.firmante || null,
+        cotizacion.numero || null,
+      ]
     );
 
     await client.query('COMMIT');
@@ -275,7 +322,7 @@ router.put('/:id', async (req, res) => {
     const { id } = req.params;
     const {
       numero, items, descuento,
-      propietario, ciudad, parrafo_contexto, condiciones_pago, tiempo_entrega, firmante,
+      propietario, ciudad, saludo, parrafo_contexto, condiciones_pago, tiempo_entrega, firmante,
     } = req.body;
 
     const cotizacionResult = await client.query('SELECT * FROM cotizaciones WHERE id = $1', [id]);
@@ -293,12 +340,12 @@ router.put('/:id', async (req, res) => {
       const total = subtotal - (parseFloat(descuento) || 0);
       await client.query(
         `UPDATE cotizaciones SET numero = $1, total = $2, descuento = $3,
-          propietario = $4, ciudad = $5, parrafo_contexto = $6, condiciones_pago = $7, tiempo_entrega = $8, firmante = $9,
+          propietario = $4, ciudad = $5, saludo = $6, parrafo_contexto = $7, condiciones_pago = $8, tiempo_entrega = $9, firmante = $10,
           updated_at = CURRENT_TIMESTAMP
-         WHERE id = $10`,
+         WHERE id = $11`,
         [
           numero || null, total, parseFloat(descuento) || 0,
-          propietario || null, ciudad || null, parrafo_contexto || PARRAFO_CONTEXTO_DEFECTO,
+          propietario || null, ciudad || null, saludo || SALUDO_DEFECTO, parrafo_contexto || PARRAFO_CONTEXTO_DEFECTO,
           JSON.stringify(condiciones_pago && condiciones_pago.length ? condiciones_pago : CONDICIONES_PAGO_DEFECTO),
           tiempo_entrega || TIEMPO_ENTREGA_DEFECTO, firmante || null,
           id,
@@ -312,12 +359,12 @@ router.put('/:id', async (req, res) => {
     } else {
       await client.query(
         `UPDATE cotizaciones SET numero = $1,
-          propietario = $2, ciudad = $3, parrafo_contexto = $4, condiciones_pago = $5, tiempo_entrega = $6, firmante = $7,
+          propietario = $2, ciudad = $3, saludo = $4, parrafo_contexto = $5, condiciones_pago = $6, tiempo_entrega = $7, firmante = $8,
           updated_at = CURRENT_TIMESTAMP
-         WHERE id = $8`,
+         WHERE id = $9`,
         [
           numero || null,
-          propietario || null, ciudad || null, parrafo_contexto || PARRAFO_CONTEXTO_DEFECTO,
+          propietario || null, ciudad || null, saludo || SALUDO_DEFECTO, parrafo_contexto || PARRAFO_CONTEXTO_DEFECTO,
           JSON.stringify(condiciones_pago && condiciones_pago.length ? condiciones_pago : CONDICIONES_PAGO_DEFECTO),
           tiempo_entrega || TIEMPO_ENTREGA_DEFECTO, firmante || null,
           id,
@@ -349,7 +396,7 @@ router.put('/:id/items-aceptada', async (req, res) => {
     const { id } = req.params;
     const {
       items, descuento,
-      propietario, ciudad, parrafo_contexto, condiciones_pago, tiempo_entrega, firmante,
+      propietario, ciudad, saludo, parrafo_contexto, condiciones_pago, tiempo_entrega, firmante,
     } = req.body;
 
     if (!items || items.length === 0) {
@@ -392,15 +439,16 @@ router.put('/:id/items-aceptada', async (req, res) => {
          total = $1, descuento = $2,
          propietario = COALESCE($3, propietario),
          ciudad = COALESCE($4, ciudad),
-         parrafo_contexto = COALESCE($5, parrafo_contexto),
-         condiciones_pago = COALESCE($6, condiciones_pago),
-         tiempo_entrega = COALESCE($7, tiempo_entrega),
-         firmante = COALESCE($8, firmante),
+         saludo = COALESCE($5, saludo),
+         parrafo_contexto = COALESCE($6, parrafo_contexto),
+         condiciones_pago = COALESCE($7, condiciones_pago),
+         tiempo_entrega = COALESCE($8, tiempo_entrega),
+         firmante = COALESCE($9, firmante),
          updated_at = CURRENT_TIMESTAMP
-       WHERE id = $9`,
+       WHERE id = $10`,
       [
         nuevoTotal, descuentoAplicado,
-        propietario ?? null, ciudad ?? null, parrafo_contexto ?? null,
+        propietario ?? null, ciudad ?? null, saludo ?? null, parrafo_contexto ?? null,
         condiciones_pago ? JSON.stringify(condiciones_pago) : null,
         tiempo_entrega ?? null, firmante ?? null,
         id,
@@ -596,6 +644,62 @@ router.get('/contratos/listar/:empresa_id', async (req, res) => {
   }
 });
 
+// 👁️ VER detalle de un contrato (usado por la pantalla "Revisar y editar documento" antes de
+// generar el PDF final).
+router.get('/contratos/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const result = await pool.query('SELECT * FROM contratos WHERE id = $1', [id]);
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Contrato no encontrado' });
+    }
+    res.json(result.rows[0]);
+  } catch (error) {
+    console.error('Error obteniendo contrato:', error);
+    res.status(500).json({ error: 'Error al obtener el contrato' });
+  }
+});
+
+// ✏️ Guardar el texto editable del contrato (cláusulas, párrafo introductorio, condiciones de
+// pago, tiempo de entrega, ciudad, firmante, número) — usado por la pantalla "Revisar y editar
+// documento" cada vez que el usuario toca "Guardar" o justo antes de "Generar PDF". No toca
+// ítems, valor_total ni fecha_entrega, que se editan desde otras pantallas.
+router.put('/contratos/:id/texto', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { clausulas, parrafo_introductorio, condiciones_pago, tiempo_entrega, ciudad, firmante, numero } = req.body;
+
+    const result = await pool.query(
+      `UPDATE contratos SET
+        clausulas = COALESCE($1, clausulas),
+        parrafo_introductorio = COALESCE($2, parrafo_introductorio),
+        condiciones_pago = COALESCE($3, condiciones_pago),
+        tiempo_entrega = COALESCE($4, tiempo_entrega),
+        ciudad = COALESCE($5, ciudad),
+        firmante = COALESCE($6, firmante),
+        numero = COALESCE($7, numero)
+       WHERE id = $8 RETURNING *`,
+      [
+        clausulas ? JSON.stringify(clausulas) : null,
+        parrafo_introductorio || null,
+        condiciones_pago ? JSON.stringify(condiciones_pago) : null,
+        tiempo_entrega || null,
+        ciudad || null,
+        firmante || null,
+        numero || null,
+        id,
+      ]
+    );
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Contrato no encontrado' });
+    }
+    res.json({ mensaje: 'Texto del contrato actualizado', contrato: result.rows[0] });
+  } catch (error) {
+    console.error('Error actualizando texto del contrato:', error);
+    res.status(500).json({ error: 'Error al actualizar el texto del contrato' });
+  }
+});
+
 // 👁️ Contrato de un proyecto específico (usado por la pestaña "Contrato" que ve AREA DE CLIENTES).
 router.get('/contratos/por-proyecto/:proyecto_id', async (req, res) => {
   try {
@@ -608,6 +712,52 @@ router.get('/contratos/por-proyecto/:proyecto_id', async (req, res) => {
   } catch (error) {
     console.error('Error obteniendo contrato del proyecto:', error);
     res.status(500).json({ error: 'Error al obtener el contrato' });
+  }
+});
+
+// 📄 Generar el PDF final del contrato desde la pantalla "Revisar y editar documento" — se llama
+// cuando el usuario toca "Generar PDF" después de revisar/editar el texto. Guarda primero
+// cualquier cambio de texto pendiente (mismo cuerpo que PUT /contratos/:id/texto) y luego genera
+// el PDF de forma síncrona (a diferencia del automático al aceptar, aquí el usuario SÍ está
+// esperando el resultado, así que no conviene responder antes de tenerlo listo).
+router.post('/contratos/:id/generar-pdf', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { clausulas, parrafo_introductorio, condiciones_pago, tiempo_entrega, ciudad, firmante, numero } = req.body;
+
+    const existente = (await pool.query('SELECT * FROM contratos WHERE id = $1', [id])).rows[0];
+    if (!existente) {
+      return res.status(404).json({ error: 'Contrato no encontrado' });
+    }
+
+    await pool.query(
+      `UPDATE contratos SET
+        clausulas = COALESCE($1, clausulas),
+        parrafo_introductorio = COALESCE($2, parrafo_introductorio),
+        condiciones_pago = COALESCE($3, condiciones_pago),
+        tiempo_entrega = COALESCE($4, tiempo_entrega),
+        ciudad = COALESCE($5, ciudad),
+        firmante = COALESCE($6, firmante),
+        numero = COALESCE($7, numero)
+       WHERE id = $8`,
+      [
+        clausulas ? JSON.stringify(clausulas) : null,
+        parrafo_introductorio || null,
+        condiciones_pago ? JSON.stringify(condiciones_pago) : null,
+        tiempo_entrega || null,
+        ciudad || null,
+        firmante || null,
+        numero || null,
+        id,
+      ]
+    );
+
+    await generarYGuardarPdfContrato(existente.cotizacion_id, id, existente.proyecto_id);
+    const actualizado = (await pool.query('SELECT * FROM contratos WHERE id = $1', [id])).rows[0];
+    res.json({ mensaje: 'PDF generado exitosamente', contrato: actualizado });
+  } catch (error) {
+    console.error('Error generando PDF del contrato:', error.message, error.stack);
+    res.status(500).json({ error: 'No se pudo generar el PDF. Intenta de nuevo en unos minutos.' });
   }
 });
 
@@ -637,32 +787,42 @@ router.post('/contratos/:id/regenerar-pdf', async (req, res) => {
   }
 });
 
-// Genera el PDF del contrato recién creado (a partir de los datos ya guardados de la
-// cotización aceptada) y lo sube a Firebase Storage, guardando la URL en contratos.pdf_url.
-// Se llama de forma asíncrona después de responder al usuario (ver POST /:id/aceptar).
+// Genera el PDF del contrato y lo sube a Firebase Storage, guardando la URL en
+// contratos.pdf_url. Se llama de forma asíncrona después de responder al usuario (ver POST
+// /:id/aceptar) y también bajo demanda desde POST /contratos/:id/generar-pdf (pantalla "Revisar
+// y editar documento") y POST /contratos/:id/regenerar-pdf.
+//
+// 2026-08-25: el texto (cláusulas, párrafo introductorio, condiciones de pago, tiempo de
+// entrega, ciudad, firmante, número) ya NO se toma de la cotización — se lee directamente de las
+// columnas propias del contrato (editables por el usuario en la pantalla de revisión), para que
+// editar el contrato no dependa de ni modifique la cotización de la que nació.
 async function generarYGuardarPdfContrato(cotizacionId, contratoId, proyectoId) {
-  const cotizacion = (await pool.query('SELECT * FROM cotizaciones WHERE id = $1', [cotizacionId])).rows[0];
-  const items = (await pool.query('SELECT * FROM cotizacion_items WHERE cotizacion_id = $1', [cotizacionId])).rows;
-  const cliente = (await pool.query('SELECT * FROM clientes WHERE id = $1', [cotizacion.cliente_id])).rows[0];
-  const empresa = (await pool.query('SELECT * FROM empresas WHERE id = $1', [cotizacion.empresa_id])).rows[0];
   const contrato = (await pool.query('SELECT * FROM contratos WHERE id = $1', [contratoId])).rows[0];
+  const cotizacion = cotizacionId
+    ? (await pool.query('SELECT * FROM cotizaciones WHERE id = $1', [cotizacionId])).rows[0]
+    : null;
+  const items = cotizacionId
+    ? (await pool.query('SELECT * FROM cotizacion_items WHERE cotizacion_id = $1', [cotizacionId])).rows
+    : [];
+  const clienteId = cotizacion?.cliente_id;
+  const cliente = clienteId ? (await pool.query('SELECT * FROM clientes WHERE id = $1', [clienteId])).rows[0] : null;
+  const empresa = (await pool.query('SELECT * FROM empresas WHERE id = $1', [contrato.empresa_id])).rows[0];
 
   const buffer = await generarPdfBuffer({
     tipoDocumento: 'contrato',
     empresa,
     cliente,
-    numero: cotizacion.numero,
+    numero: contrato.numero,
     fecha: contrato.created_at,
     items,
-    total: cotizacion.total,
+    total: contrato.valor_total,
     fechaEntrega: contrato.fecha_entrega,
-    ciudad: cotizacion.ciudad,
-    propietario: cotizacion.propietario,
-    parrafo: cotizacion.parrafo_contexto,
-    descuento: cotizacion.descuento,
-    condicionesPago: cotizacion.condiciones_pago,
-    tiempoEntrega: cotizacion.tiempo_entrega,
-    firmante: cotizacion.firmante,
+    ciudad: contrato.ciudad,
+    parrafoIntroductorio: contrato.parrafo_introductorio,
+    clausulas: contrato.clausulas,
+    condicionesPago: contrato.condiciones_pago,
+    tiempoEntrega: contrato.tiempo_entrega,
+    firmante: contrato.firmante,
   });
 
   const rutaDestino = `contratos/contrato_${contratoId}_${Date.now()}.pdf`;
