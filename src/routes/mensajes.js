@@ -329,5 +329,48 @@ router.get('/no-leidos/:usuario_id', async (req, res) => {
   }
 });
 
+// 🔧 TEMPORAL — endpoint de diagnóstico para investigar el bug del indicador de mensaje que
+// lleva a la ficha equivocada (2026-08-25). Protegido con clave simple porque expone contenido
+// de chats. SE DEBE BORRAR apenas termine el diagnóstico, en el mismo commit que el fix real.
+router.get('/debug/todo', async (req, res) => {
+  try {
+    if (req.query.clave !== 'diag2026alejo') {
+      return res.status(403).json({ error: 'no autorizado' });
+    }
+    const mensajes = await pool.query(
+      `SELECT m.id, m.proyecto_id, pr.nombre AS proyecto_nombre, m.area_id, a.nombre AS area_nombre,
+              m.usuario_id AS remitente_id, ru.nombre AS remitente_nombre,
+              m.destinatario_usuario_id AS destinatario_id, du.nombre AS destinatario_nombre,
+              m.contenido, m.leido, m.created_at
+       FROM mensajes m
+       JOIN proyectos pr ON pr.id = m.proyecto_id
+       LEFT JOIN areas_catalogo a ON a.id = m.area_id
+       LEFT JOIN usuarios ru ON ru.id = m.usuario_id
+       LEFT JOIN usuarios du ON du.id = m.destinatario_usuario_id
+       ORDER BY m.created_at DESC LIMIT 30`
+    );
+    const equipo = await pool.query(
+      `SELECT pe.id, pe.proyecto_id, pr.nombre AS proyecto_nombre, pe.area_id, a.nombre AS area_nombre,
+              pe.usuario_id, u.nombre AS usuario_nombre, pe.pausado
+       FROM proyecto_equipo pe
+       JOIN proyectos pr ON pr.id = pe.proyecto_id
+       JOIN areas_catalogo a ON a.id = pe.area_id
+       LEFT JOIN usuarios u ON u.id = pe.usuario_id
+       ORDER BY pe.id DESC LIMIT 30`
+    );
+    const roles = await pool.query(
+      `SELECT uer.usuario_id, u.nombre, uer.empresa_id, uer.area_id, a.nombre AS area_nombre, uer.estado
+       FROM usuario_empresa_rol uer
+       JOIN areas_catalogo a ON a.id = uer.area_id
+       LEFT JOIN usuarios u ON u.id = uer.usuario_id
+       ORDER BY uer.id DESC LIMIT 30`
+    );
+    res.json({ mensajes: mensajes.rows, equipo: equipo.rows, roles: roles.rows });
+  } catch (error) {
+    console.error('Error en debug/todo:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
 module.exports = router;
 module.exports.vaciarChat = vaciarChat;
