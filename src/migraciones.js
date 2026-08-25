@@ -119,6 +119,18 @@ async function aplicarMigraciones() {
     // nombre tal como era al momento del borrado, aunque la cuenta ya no exista.
     await pool.query(`ALTER TABLE mensajes ADD COLUMN IF NOT EXISTS remitente_nombre_snapshot VARCHAR(255)`);
 
+    // leido en mensajes (2026-08-25, indicador de "mensajes sin leer" en cascada Empresas →
+    // Proyecto → Actividad → Persona, más el badge numérico del ícono de la app): empieza en
+    // false y se pone en true cuando el DESTINATARIO abre esa conversación puntual (ver GET
+    // /:proyecto_id/:area_id/:destinatario_usuario_id en mensajes.js). DEFAULT false para que los
+    // mensajes ya existentes (enviados antes de este cambio) no aparezcan retroactivamente como
+    // "sin leer" en cascada por todos lados — se asumen leídos, ya que llevan ahí desde antes de
+    // que esta función existiera.
+    await pool.query(`ALTER TABLE mensajes ADD COLUMN IF NOT EXISTS leido BOOLEAN NOT NULL DEFAULT true`);
+    // El DEFAULT de la columna es true (para no afectar retroactivamente el historial ya
+    // existente, ver comentario arriba), pero los mensajes NUEVOS sí deben nacer en false — eso
+    // se controla explícitamente en el INSERT del endpoint /enviar, no aquí.
+
     // usuario_id NULLABLE con ON DELETE SET NULL en fotos_avance y planos_3d: si se elimina a
     // alguien de la plataforma por completo, sus fotos de avance y planos 3D de proyectos
     // anteriores se CONSERVAN (son evidencia de obra que la empresa quiere conservar) — solo se

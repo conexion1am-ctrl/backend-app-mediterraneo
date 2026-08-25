@@ -12,7 +12,12 @@ const pool = new Pool({
 // Envía una notificación push a través del servicio gratuito de Expo. No requiere configurar
 // Firebase aparte: Expo se encarga de entregarla en Android e iOS usando el "push token" que
 // cada celular genera y guarda en la tabla usuarios (columna push_token).
-async function enviarPush(pushToken, titulo, cuerpo, data) {
+//
+// "badge" (opcional): el total de mensajes sin leer del destinatario en TODA la app (no solo
+// este chat), calculado por quien llama a esta función. Expo lo usa para fijar el numerito
+// sobre el ícono de la app en el celular del destinatario — sin esto, el badge nunca se movía
+// (ver historial: antes no se mandaba esta clave en absoluto).
+async function enviarPush(pushToken, titulo, cuerpo, data, badge) {
   if (!pushToken) return;
   try {
     await fetch('https://exp.host/--/api/v2/push/send', {
@@ -28,6 +33,7 @@ async function enviarPush(pushToken, titulo, cuerpo, data) {
         title: titulo,
         body: cuerpo,
         data: data || {},
+        ...(badge != null ? { badge } : {}),
       }),
     });
   } catch (error) {
@@ -51,8 +57,12 @@ router.post('/enviar', async (req, res) => {
     const remitenteActual = await pool.query('SELECT nombre FROM usuarios WHERE id = $1', [usuario_id]);
     const nombreRemitenteActual = remitenteActual.rows[0]?.nombre || null;
 
+    // leido = false explícito: la columna tiene DEFAULT true (para no afectar retroactivamente
+    // el historial ya existente al momento de crear la columna, ver comentario en
+    // migraciones.js), pero todo mensaje NUEVO debe nacer sin leer, para que el indicador en
+    // cascada (Empresas → Proyecto → Actividad → Persona) y el badge del ícono lo detecten.
     const result = await pool.query(
-      'INSERT INTO mensajes (proyecto_id, area_id, usuario_id, destinatario_usuario_id, contenido, remitente_nombre_snapshot) VALUES ($1, $2, $3, $4, $5, $6) RETURNING *',
+      'INSERT INTO mensajes (proyecto_id, area_id, usuario_id, destinatario_usuario_id, contenido, remitente_nombre_snapshot, leido) VALUES ($1, $2, $3, $4, $5, $6, false) RETURNING *',
       [proyecto_id, area_id, usuario_id, destinatario_usuario_id, contenido || '', nombreRemitenteActual]
     );
 
@@ -75,6 +85,13 @@ router.post('/enviar', async (req, res) => {
     if (pushToken) {
       const nombreRemitente = remitente.rows[0]?.nombre || 'Alguien';
       const proyectoRow = proyecto.rows[0] || {};
+      // Total de mensajes sin leer del DESTINATARIO (sumando todos sus chats, no solo este),
+      // para que el badge del ícono de la app se pueda fijar directamente al recibir el push,
+      // sin depender de que la app esté abierta en primer plano para recalcularlo.
+      const totalSinLeer = await pool.query(
+        'SELECT COUNT(*) FROM mensajes WHERE destinatario_usuario_id = $1 AND leido = false',
+        [destinatario_usuario_id]
+      );
       enviarPush(
         pushToken,
         nombreRemitente,
@@ -87,7 +104,8 @@ router.post('/enviar', async (req, res) => {
           area_id,
           area_nombre: areaCatalogo.rows[0]?.nombre || '',
           remitente_usuario_id: usuario_id,
-        }
+        },
+        Number(totalSinLeer.rows[0].count)
       );
     }
 
@@ -130,6 +148,17 @@ router.get('/:proyecto_id/:area_id/:destinatario_usuario_id', async (req, res) =
            OR (m.usuario_id = $4::int AND m.destinatario_usuario_id = $3::int))
        ORDER BY m.created_at ASC`,
       [proyecto_id, area_id, mi_usuario_id, destinatario_usuario_id]
+    );
+
+    // Al abrir esta conversación, se marcan como leídos todos los mensajes que el OTRO
+    // participante me escribió a mí (nunca los que yo le escribí) en esta área/proyecto puntual
+    // — mismo criterio que WhatsApp: abrir el chat marca todo lo pendiente de esa conversación,
+    // no mensaje por mensaje. Esto alimenta el indicador en cascada (Empresas → Proyecto →
+    // Actividad → Persona) y el badge del ícono de la app.
+    await pool.query(
+      `UPDATE mensajes SET leido = true
+       WHERE proyecto_id = $1 AND area_id = $2 AND usuario_id = $3::int AND destinatario_usuario_id = $4::int AND leido = false`,
+      [proyecto_id, area_id, destinatario_usuario_id, mi_usuario_id]
     );
 
     // Traemos los archivos adjuntos de todos estos mensajes en una sola consulta y los
@@ -266,6 +295,37 @@ router.delete('/vaciar/:proyecto_id/:area_id/:usuario_a/:usuario_b', async (req,
     res.status(500).json({ error: 'Error al vaciar el chat' });
   } finally {
     client.release();
+  }
+});
+
+// 🔴 LISTAR todos los mensajes sin leer dirigidos a un usuario, en toda la app (2026-08-25).
+// Devuelve una fila plana por cada mensaje sin leer, con los datos mínimos para que el frontend
+// arme la cascada de indicadores (Empresas → Proyecto → Actividad → Persona) sin tener que hacer
+// una llamada distinta por cada nivel — se agrupa localmente en cada pantalla.
+//
+// No filtramos por proyecto_equipo (asignación): Gerencia, Área Administrativa, Área de
+// Logística y Área Comercial ven TODOS los proyectos de su empresa (verProyectos: 'todos' en
+// utils/roles.js del frontend), no solo los que tienen en proyecto_equipo — así que un mensaje
+// sin leer en un proyecto donde el gerente no está "asignado" igual debe contar para él si es de
+// su empresa. Por eso este endpoint no cruza con proyecto_equipo: trae TODO lo sin leer dirigido
+// a mí, y es el FRONTEND quien decide, pantalla por pantalla, si ese proyecto/área es visible
+// para el área de quien está mirando (mismo criterio que ya usan ProyectosScreen/AreaProyectoScreen
+// hoy para decidir qué mostrar).
+router.get('/no-leidos/:usuario_id', async (req, res) => {
+  try {
+    const { usuario_id } = req.params;
+    const result = await pool.query(
+      `SELECT m.id, m.proyecto_id, m.area_id, m.usuario_id AS remitente_usuario_id,
+              p.empresa_id
+       FROM mensajes m
+       JOIN proyectos p ON p.id = m.proyecto_id
+       WHERE m.destinatario_usuario_id = $1 AND m.leido = false`,
+      [usuario_id]
+    );
+    res.json({ total: result.rows.length, sinLeer: result.rows });
+  } catch (error) {
+    console.error('Error listando mensajes sin leer:', error);
+    res.status(500).json({ error: 'Error al listar mensajes sin leer' });
   }
 });
 
