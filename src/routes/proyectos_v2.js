@@ -4,7 +4,7 @@ const router = express.Router();
 require('dotenv').config();
 const { esGerencia } = require('../utils/permisos');
 const { borrarArchivoDeStorage } = require('../utils/firebaseAdmin');
-const { borrarDependenciasDeProyecto, borrarDependenciasDeArea } = require('../utils/cascadaProyecto');
+const { borrarDependenciasDeProyecto, borrarDependenciasDeArea, configurarProyectoNuevo } = require('../utils/cascadaProyecto');
 const { vaciarChat } = require('./mensajes');
 
 const pool = new Pool({
@@ -16,7 +16,7 @@ const pool = new Pool({
 router.post('/crear', async (req, res) => {
   const client = await pool.connect();
   try {
-    const { empresa_id, nombre, direccion, area_m2, ubicacion_lat, ubicacion_lng, areas_ids } = req.body;
+    const { empresa_id, nombre, direccion, area_m2, ubicacion_lat, ubicacion_lng, areas_ids, creado_por_usuario_id } = req.body;
 
     if (!empresa_id || !nombre) {
       return res.status(400).json({ error: 'empresa_id y nombre son obligatorios' });
@@ -25,20 +25,33 @@ router.post('/crear', async (req, res) => {
     await client.query('BEGIN');
 
     const proyectoResult = await client.query(
-      'INSERT INTO proyectos (empresa_id, nombre, direccion, area_m2, ubicacion_lat, ubicacion_lng) VALUES ($1, $2, $3, $4, $5, $6) RETURNING *',
-      [empresa_id, nombre, direccion || null, area_m2 || null, ubicacion_lat || null, ubicacion_lng || null]
+      'INSERT INTO proyectos (empresa_id, nombre, direccion, area_m2, ubicacion_lat, ubicacion_lng, creado_por_usuario_id) VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING *',
+      [empresa_id, nombre, direccion || null, area_m2 || null, ubicacion_lat || null, ubicacion_lng || null, creado_por_usuario_id || null]
     );
     const proyecto = proyectoResult.rows[0];
 
-    // Insertar las actividades (áreas) seleccionadas
+    // Insertar las actividades (áreas) que el usuario seleccionó manualmente en el modal.
+    // WHERE NOT EXISTS por seguridad: GERENCIA/AREA ADMINISTRATIVA/AREA DE LOGISTICA ya no se
+    // ofrecen como checkbox en el modal (se crean siempre automáticamente, ver
+    // configurarProyectoNuevo más abajo), pero este INSERT queda protegido igual contra
+    // duplicados por si areas_ids trae una de esas 3, o la misma área repetida por error.
     if (areas_ids && areas_ids.length > 0) {
       for (const areaId of areas_ids) {
         await client.query(
-          'INSERT INTO proyecto_actividades (proyecto_id, area_id) VALUES ($1, $2)',
+          `INSERT INTO proyecto_actividades (proyecto_id, area_id)
+           SELECT $1, $2 WHERE NOT EXISTS (
+             SELECT 1 FROM proyecto_actividades WHERE proyecto_id = $1 AND area_id = $2
+           )`,
           [proyecto.id, areaId]
         );
       }
     }
+
+    // Además de lo seleccionado a mano, todo proyecto nace SIEMPRE con GERENCIA, AREA
+    // ADMINISTRATIVA y AREA DE LOGISTICA como actividades (ver configurarProyectoNuevo) — no son
+    // opcionales, existen en todos los proyectos por defecto — y con los gerentes de la empresa
+    // más quien lo creó ya auto-asignados en su ficha correspondiente.
+    await configurarProyectoNuevo(client, proyecto.id, empresa_id, creado_por_usuario_id || null);
 
     await client.query('COMMIT');
     res.status(201).json({ mensaje: 'Proyecto creado exitosamente', proyecto });

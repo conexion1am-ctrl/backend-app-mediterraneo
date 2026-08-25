@@ -211,6 +211,16 @@ async function aplicarMigraciones() {
       `);
     }
 
+    // proyectos.creado_por_usuario_id: quién creó el proyecto (Gerencia o Administrativa, por
+    // cualquiera de los 3 caminos de creación: manual, desde un contrato recién aceptado, o al
+    // recrear un proyecto eliminado). Antes este dato no se guardaba en ningún lado — se necesita
+    // ahora para el rediseño de "Actividades" del proyecto (2026-08-24): al crear un proyecto,
+    // quien lo crea queda auto-asignado a la ficha de su propia área (GERENCIA o ADMINISTRATIVA),
+    // y por separado se auto-asignan TODOS los gerentes activos de la empresa a la ficha GERENCIA
+    // sin importar quién haya creado el proyecto. ON DELETE SET NULL: si esa cuenta se elimina de
+    // la plataforma más adelante, el proyecto no debe romperse ni perder su registro histórico.
+    await pool.query(`ALTER TABLE proyectos ADD COLUMN IF NOT EXISTS creado_por_usuario_id INT REFERENCES usuarios(id) ON DELETE SET NULL`);
+
     // areas_catalogo: catálogo fijo de áreas (Gerencia, Administrativa, Logística, Comercial,
     // Proveedores, Clientes, y las 10 "subáreas" de oficio: Obra Civil, Electricidad, etc.). Esta
     // tabla NUNCA se vuelve a llenar sola si queda vacía (por ejemplo, tras un vaciado accidental

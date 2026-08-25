@@ -83,4 +83,75 @@ async function borrarDependenciasDeArea(client, proyectoId, areaId) {
   return urlsABorrar;
 }
 
-module.exports = { borrarDependenciasDeProyecto, borrarDependenciasDeArea };
+// Termina de "armar" un proyecto recién creado (2026-08-24, rediseño de Actividades/Equipo):
+// crea automáticamente las 3 actividades base (GERENCIA, AREA ADMINISTRATIVA, AREA DE LOGISTICA
+// — sin importar cuáles otras actividades haya elegido manualmente quien lo creó) y auto-asigna
+// personal en proyecto_equipo: TODOS los gerentes activos de la empresa a la ficha GERENCIA, y
+// quien creó el proyecto a la ficha de SU PROPIA área (solo si esa área es GERENCIA o
+// AREA ADMINISTRATIVA — si el proyecto lo crea el sistema sin un usuario real detrás, como al
+// recrear desde un contrato sin usuario_id, simplemente no hay nadie que auto-asignar ahí).
+// Recibe `client` ya dentro de una transacción BEGIN (misma conexión que insertó el proyecto).
+async function configurarProyectoNuevo(client, proyectoId, empresaId, creadoPorUsuarioId) {
+  const areasBase = await client.query(
+    `SELECT id, nombre FROM areas_catalogo WHERE nombre IN ('GERENCIA', 'AREA ADMINISTRATIVA', 'AREA DE LOGISTICA')`
+  );
+  const idPorNombre = {};
+  areasBase.rows.forEach((a) => { idPorNombre[a.nombre] = a.id; });
+
+  // Actividades base: INSERT ... WHERE NOT EXISTS en vez de un SELECT previo + INSERT, para que
+  // sea seguro aunque en el futuro se llame esta función más de una vez sobre el mismo proyecto.
+  for (const areaId of Object.values(idPorNombre)) {
+    await client.query(
+      `INSERT INTO proyecto_actividades (proyecto_id, area_id)
+       SELECT $1, $2 WHERE NOT EXISTS (
+         SELECT 1 FROM proyecto_actividades WHERE proyecto_id = $1 AND area_id = $2
+       )`,
+      [proyectoId, areaId]
+    );
+  }
+
+  // Todos los gerentes activos de la empresa, auto-asignados a la ficha GERENCIA de este proyecto.
+  if (idPorNombre['GERENCIA']) {
+    const gerentes = await client.query(
+      `SELECT uer.usuario_id
+       FROM usuario_empresa_rol uer
+       JOIN areas_catalogo a ON a.id = uer.area_id
+       WHERE uer.empresa_id = $1 AND a.nombre = 'GERENCIA' AND uer.estado = 'activo'`,
+      [empresaId]
+    );
+    for (const gerente of gerentes.rows) {
+      await client.query(
+        `INSERT INTO proyecto_equipo (proyecto_id, usuario_id, area_id)
+         SELECT $1, $2, $3 WHERE NOT EXISTS (
+           SELECT 1 FROM proyecto_equipo WHERE proyecto_id = $1 AND usuario_id = $2
+         )`,
+        [proyectoId, gerente.usuario_id, idPorNombre['GERENCIA']]
+      );
+    }
+  }
+
+  // Quien creó el proyecto, auto-asignado a la ficha de su propia área — solo si esa área es
+  // GERENCIA (ya cubierto arriba si es gerente, este INSERT queda protegido por el mismo
+  // NOT EXISTS y no duplica) o AREA ADMINISTRATIVA.
+  if (creadoPorUsuarioId && empresaId) {
+    const areaCreador = await client.query(
+      `SELECT a.id, a.nombre
+       FROM usuario_empresa_rol uer
+       JOIN areas_catalogo a ON a.id = uer.area_id
+       WHERE uer.usuario_id = $1 AND uer.empresa_id = $2 AND uer.estado = 'activo'`,
+      [creadoPorUsuarioId, empresaId]
+    );
+    const area = areaCreador.rows[0];
+    if (area && (area.nombre === 'GERENCIA' || area.nombre === 'AREA ADMINISTRATIVA')) {
+      await client.query(
+        `INSERT INTO proyecto_equipo (proyecto_id, usuario_id, area_id)
+         SELECT $1, $2, $3 WHERE NOT EXISTS (
+           SELECT 1 FROM proyecto_equipo WHERE proyecto_id = $1 AND usuario_id = $2
+         )`,
+        [proyectoId, creadoPorUsuarioId, area.id]
+      );
+    }
+  }
+}
+
+module.exports = { borrarDependenciasDeProyecto, borrarDependenciasDeArea, configurarProyectoNuevo };

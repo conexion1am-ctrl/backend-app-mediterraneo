@@ -5,6 +5,7 @@ require('dotenv').config();
 const { generarPdfBuffer } = require('../utils/generarPdf');
 const { subirBufferAStorage, borrarArchivoDeStorage } = require('../utils/firebaseAdmin');
 const { esGerencia } = require('../utils/permisos');
+const { configurarProyectoNuevo } = require('../utils/cascadaProyecto');
 
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
@@ -190,6 +191,7 @@ router.post('/contratos/:id/crear-proyecto', async (req, res) => {
   const client = await pool.connect();
   try {
     const { id } = req.params;
+    const { creado_por_usuario_id } = req.body;
 
     const contratoResult = await client.query('SELECT * FROM contratos WHERE id = $1', [id]);
     if (contratoResult.rows.length === 0) {
@@ -215,8 +217,8 @@ router.post('/contratos/:id/crear-proyecto', async (req, res) => {
 
     const nuevoProyecto = await client.query(
       `INSERT INTO proyectos
-        (empresa_id, nombre, direccion, area_m2, cliente_nombre_snapshot, cliente_celular_snapshot, cliente_cedula_snapshot)
-       VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING *`,
+        (empresa_id, nombre, direccion, area_m2, cliente_nombre_snapshot, cliente_celular_snapshot, cliente_cedula_snapshot, creado_por_usuario_id)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING *`,
       [
         contrato.empresa_id,
         contrato.proyecto_nombre_snapshot || 'Proyecto sin nombre',
@@ -225,9 +227,14 @@ router.post('/contratos/:id/crear-proyecto', async (req, res) => {
         cliente?.nombre || null,
         cliente?.celular || null,
         cliente?.cedula || null,
+        creado_por_usuario_id || null,
       ]
     );
     const proyecto = nuevoProyecto.rows[0];
+
+    // Igual que en la creación manual: toda actividad nace con GERENCIA/ADMINISTRATIVA/LOGISTICA
+    // por defecto, con los gerentes de la empresa y quien creó el proyecto ya auto-asignados.
+    await configurarProyectoNuevo(client, proyecto.id, contrato.empresa_id, creado_por_usuario_id || null);
 
     await client.query('UPDATE contratos SET proyecto_id = $1 WHERE id = $2', [proyecto.id, id]);
     if (contrato.cotizacion_id) {
