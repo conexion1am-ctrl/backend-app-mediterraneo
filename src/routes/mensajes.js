@@ -189,6 +189,48 @@ router.get('/no-leidos/:usuario_id', async (req, res) => {
   }
 });
 
+// 🔍 TEMPORAL (2026-08-25): endpoint de diagnóstico para revisar por qué el usuario reporta que
+// el ícono de mensaje sin leer nunca aparece, ni siquiera cerrando y abriendo la app de nuevo.
+// Muestra los mensajes reales más recientes con su estado leido/no-leido, remitente y
+// destinatario, para descartar (o confirmar) que hay mensajes de prueba marcados como leídos por
+// error. Protegido con clave simple en query string. BORRAR este endpoint junto con este
+// comentario apenas se termine el diagnóstico — no debe quedar en producción.
+//
+// IMPORTANTE: debe ir declarado ANTES que la ruta genérica de abajo (/:proyecto_id/:destinatario_
+// usuario_id) — ambas tienen 2 segmentos en la URL, así que si esta ruta quedara después, Express
+// la interceptaría interpretando "debug" como proyecto_id y "estado" como destinatario_usuario_id
+// (mismo error que ya rompió /no-leidos/:usuario_id una vez, ver comentario más arriba en este
+// archivo). Ya pasó exactamente este bug al declarar esta ruta al final del archivo.
+router.get('/debug/estado', async (req, res) => {
+  if (req.query.clave !== 'diag2026alejo') {
+    return res.status(404).json({ error: 'No encontrado' });
+  }
+  try {
+    const mensajes = await pool.query(
+      `SELECT m.id, m.proyecto_id, m.area_id, m.usuario_id AS remitente_id,
+              ur.nombre AS remitente_nombre,
+              m.destinatario_usuario_id,
+              ud.nombre AS destinatario_nombre,
+              m.contenido, m.leido, m.creado_en
+       FROM mensajes m
+       LEFT JOIN usuarios ur ON ur.id = m.usuario_id
+       LEFT JOIN usuarios ud ON ud.id = m.destinatario_usuario_id
+       ORDER BY m.creado_en DESC
+       LIMIT 40`
+    );
+    const resumenLeido = await pool.query(
+      `SELECT leido, COUNT(*) AS total FROM mensajes GROUP BY leido`
+    );
+    res.json({
+      mensajes_recientes: mensajes.rows,
+      resumen_leido_vs_no_leido: resumenLeido.rows,
+    });
+  } catch (error) {
+    console.error('Error en debug/estado:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
 // 👁️ VER la conversación individual con una persona específica, dentro de un proyecto.
 //
 // "mi_usuario_id" (query param obligatorio): el usuario_id de quien está pidiendo el chat (el
@@ -369,42 +411,6 @@ router.delete('/vaciar/:proyecto_id/:usuario_a/:usuario_b', async (req, res) => 
     res.status(500).json({ error: 'Error al vaciar el chat' });
   } finally {
     client.release();
-  }
-});
-
-// 🔍 TEMPORAL (2026-08-25): endpoint de diagnóstico para revisar por qué el usuario reporta que
-// el ícono de mensaje sin leer nunca aparece, ni siquiera cerrando y abriendo la app de nuevo.
-// Muestra los mensajes reales más recientes con su estado leido/no-leido, remitente y
-// destinatario, para descartar (o confirmar) que hay mensajes de prueba marcados como leídos por
-// error. Protegido con clave simple en query string. BORRAR este endpoint junto con este
-// comentario apenas se termine el diagnóstico — no debe quedar en producción.
-router.get('/debug/estado', async (req, res) => {
-  if (req.query.clave !== 'diag2026alejo') {
-    return res.status(404).json({ error: 'No encontrado' });
-  }
-  try {
-    const mensajes = await pool.query(
-      `SELECT m.id, m.proyecto_id, m.area_id, m.usuario_id AS remitente_id,
-              ur.nombre AS remitente_nombre,
-              m.destinatario_usuario_id,
-              ud.nombre AS destinatario_nombre,
-              m.contenido, m.leido, m.creado_en
-       FROM mensajes m
-       LEFT JOIN usuarios ur ON ur.id = m.usuario_id
-       LEFT JOIN usuarios ud ON ud.id = m.destinatario_usuario_id
-       ORDER BY m.creado_en DESC
-       LIMIT 40`
-    );
-    const resumenLeido = await pool.query(
-      `SELECT leido, COUNT(*) AS total FROM mensajes GROUP BY leido`
-    );
-    res.json({
-      mensajes_recientes: mensajes.rows,
-      resumen_leido_vs_no_leido: resumenLeido.rows,
-    });
-  } catch (error) {
-    console.error('Error en debug/estado:', error);
-    res.status(500).json({ error: error.message });
   }
 });
 
