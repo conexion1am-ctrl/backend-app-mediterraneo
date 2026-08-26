@@ -211,11 +211,11 @@ router.get('/debug/estado', async (req, res) => {
               ur.nombre AS remitente_nombre,
               m.destinatario_usuario_id,
               ud.nombre AS destinatario_nombre,
-              m.contenido, m.leido, m.creado_en
+              m.contenido, m.leido, m.created_at
        FROM mensajes m
        LEFT JOIN usuarios ur ON ur.id = m.usuario_id
        LEFT JOIN usuarios ud ON ud.id = m.destinatario_usuario_id
-       ORDER BY m.creado_en DESC
+       ORDER BY m.created_at DESC
        LIMIT 40`
     );
     const resumenLeido = await pool.query(
