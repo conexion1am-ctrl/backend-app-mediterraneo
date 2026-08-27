@@ -26,6 +26,26 @@ const CONDICIONES_PAGO_DEFECTO = [
   { porcentaje: 25, descripcion: 'A la entrega de la obra blanca' },
   { porcentaje: 25, descripcion: 'A la entrega final de la obra, incluyendo carpintería' },
 ];
+// Frase fija que antecede a los porcentajes de condiciones de pago, tal como aparece en el
+// documento real de la empresa ("Cotizacion de Ejemplo Exacto.docx"). No es editable por
+// cotización — es el mismo texto siempre, solo cambian los porcentajes/descripciones de abajo.
+const PARRAFO_CONDICIONES_PAGO = 'El pago del costo total se plantea de la siguiente manera:';
+
+// Numeración automática de cotizaciones (2026-08-26, a pedido del usuario): arranca en 1001 por
+// empresa y sube de 1 en 1. Ya NO la escribe el usuario — evita que dos cotizaciones creadas casi
+// al tiempo terminen con el mismo número a mano. Se calcula tomando el número más alto ya usado
+// por esa empresa (ignorando cotizaciones viejas sin número o con formato no numérico) y sumando 1.
+async function calcularSiguienteNumero(client, empresaId) {
+  const resultado = await client.query(
+    `SELECT numero FROM cotizaciones
+     WHERE empresa_id = $1 AND numero ~ '^[0-9]+$'
+     ORDER BY numero::INT DESC LIMIT 1`,
+    [empresaId]
+  );
+  if (resultado.rows.length === 0) return '1001';
+  const ultimo = parseInt(resultado.rows[0].numero, 10);
+  return String(Math.max(ultimo + 1, 1001));
+}
 
 // Cláusulas legales estándar del contrato de obra (2026-08-25): antes vivían fijas en
 // generarPdf.js sin que nadie pudiera tocarlas desde la app. Ahora son solo el PUNTO DE PARTIDA
@@ -58,8 +78,8 @@ router.post('/crear', async (req, res) => {
   const client = await pool.connect();
   try {
     const {
-      empresa_id, cliente_id, proyecto_id, numero, items, descuento,
-      propietario, ciudad, saludo, parrafo_contexto, condiciones_pago, tiempo_entrega, firmante,
+      empresa_id, cliente_id, proyecto_id, items, descuento,
+      propietario, ciudad, saludo, parrafo_contexto, nombre_proyecto, condiciones_pago, tiempo_entrega, firmante,
     } = req.body;
 
     if (!empresa_id || !cliente_id || !items || items.length === 0) {
@@ -68,19 +88,25 @@ router.post('/crear', async (req, res) => {
 
     await client.query('BEGIN');
 
+    // El número YA NO viene del frontend (ver calcularSiguienteNumero arriba): siempre se asigna
+    // aquí de forma automática y secuencial por empresa, para que nunca se repita entre dos
+    // cotizaciones creadas casi al mismo tiempo.
+    const numero = await calcularSiguienteNumero(client, empresa_id);
+
     const subtotal = items.reduce((sum, item) => sum + parseFloat(item.valor), 0);
     const total = subtotal - (parseFloat(descuento) || 0);
 
     const cotizacionResult = await client.query(
       `INSERT INTO cotizaciones
         (empresa_id, cliente_id, proyecto_id, numero, total, descuento,
-         propietario, ciudad, saludo, parrafo_contexto, condiciones_pago, tiempo_entrega, firmante)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13) RETURNING *`,
+         propietario, ciudad, saludo, parrafo_contexto, nombre_proyecto, condiciones_pago, tiempo_entrega, firmante)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14) RETURNING *`,
       [
-        empresa_id, cliente_id, proyecto_id || null, numero || null, total, parseFloat(descuento) || 0,
+        empresa_id, cliente_id, proyecto_id || null, numero, total, parseFloat(descuento) || 0,
         propietario || null, ciudad || null,
         saludo || SALUDO_DEFECTO,
         parrafo_contexto || PARRAFO_CONTEXTO_DEFECTO,
+        nombre_proyecto || null,
         JSON.stringify(condiciones_pago && condiciones_pago.length ? condiciones_pago : CONDICIONES_PAGO_DEFECTO),
         tiempo_entrega || TIEMPO_ENTREGA_DEFECTO,
         firmante || null,
@@ -114,9 +140,11 @@ router.get('/listar/:empresa_id', async (req, res) => {
     // usando el nombre que quedó guardado en cliente_nombre_snapshot al momento de eliminarlo.
     // También traemos nombre_proyecto y mts2 del cliente, para mostrarlos en la ficha de la
     // pantalla de Cotizaciones (si el cliente ya fue eliminado, estos quedan en null).
+    // COALESCE(co.nombre_proyecto, cl.nombre_proyecto): la cotización puede tener su propio
+    // nombre de proyecto editado; si no lo tiene, se cae al de la ficha del cliente.
     const result = await pool.query(
       `SELECT co.*, COALESCE(cl.nombre, co.cliente_nombre_snapshot) AS cliente_nombre,
-              cl.nombre_proyecto, cl.mts2
+              COALESCE(co.nombre_proyecto, cl.nombre_proyecto) AS nombre_proyecto, cl.mts2
        FROM cotizaciones co
        LEFT JOIN clientes cl ON cl.id = co.cliente_id
        WHERE co.empresa_id = $1
@@ -127,6 +155,72 @@ router.get('/listar/:empresa_id', async (req, res) => {
   } catch (error) {
     console.error('Error listando cotizaciones:', error);
     res.status(500).json({ error: 'Error al listar cotizaciones' });
+  }
+});
+
+// ===================== PLANTILLAS DE COTIZACIÓN =====================
+// Un "molde" reutilizable con ítems/textos ya definidos, para no reescribir cotizaciones muy
+// parecidas entre sí (2026-08-26, a pedido del usuario). No lleva cliente ni proyecto asociado.
+// IMPORTANTE: estas rutas van declaradas ANTES de router.get('/:id', ...) más abajo — Express
+// hace matching en orden de declaración, así que si '/plantillas/listar/:empresa_id' quedara
+// después de '/:id', una petición a /plantillas/listar/5 caería en '/:id' (con id="plantillas")
+// antes de llegar aquí. Este es el mismo patrón de bug de rutas que ya mordió esta app antes
+// (ver mensajes.js) — cualquier ruta nueva con más de un segmento fijo debe ir antes de '/:id'.
+
+// 📋 LISTAR plantillas de una empresa
+router.get('/plantillas/listar/:empresa_id', async (req, res) => {
+  try {
+    const { empresa_id } = req.params;
+    const result = await pool.query(
+      'SELECT * FROM plantillas_cotizacion WHERE empresa_id = $1 ORDER BY nombre ASC',
+      [empresa_id]
+    );
+    res.json({ plantillas: result.rows });
+  } catch (error) {
+    console.error('Error listando plantillas:', error);
+    res.status(500).json({ error: 'Error al listar plantillas' });
+  }
+});
+
+// 📝 CREAR plantilla nueva (desde cero o "guardar como plantilla" desde una cotización)
+router.post('/plantillas/crear', async (req, res) => {
+  try {
+    const { empresa_id, nombre, saludo, parrafo_contexto, condiciones_pago, tiempo_entrega, items, descuento } = req.body;
+
+    if (!empresa_id || !nombre || !items || items.length === 0) {
+      return res.status(400).json({ error: 'empresa_id, nombre e items son obligatorios' });
+    }
+
+    const result = await pool.query(
+      `INSERT INTO plantillas_cotizacion
+        (empresa_id, nombre, saludo, parrafo_contexto, condiciones_pago, tiempo_entrega, items, descuento)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING *`,
+      [
+        empresa_id, nombre,
+        saludo || SALUDO_DEFECTO,
+        parrafo_contexto || PARRAFO_CONTEXTO_DEFECTO,
+        JSON.stringify(condiciones_pago && condiciones_pago.length ? condiciones_pago : CONDICIONES_PAGO_DEFECTO),
+        tiempo_entrega || TIEMPO_ENTREGA_DEFECTO,
+        JSON.stringify(items),
+        parseFloat(descuento) || 0,
+      ]
+    );
+    res.status(201).json({ mensaje: 'Plantilla guardada exitosamente', plantilla: result.rows[0] });
+  } catch (error) {
+    console.error('Error creando plantilla:', error);
+    res.status(500).json({ error: 'Error al crear plantilla' });
+  }
+});
+
+// 🗑️ ELIMINAR plantilla
+router.delete('/plantillas/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    await pool.query('DELETE FROM plantillas_cotizacion WHERE id = $1', [id]);
+    res.json({ mensaje: 'Plantilla eliminada exitosamente' });
+  } catch (error) {
+    console.error('Error eliminando plantilla:', error);
+    res.status(500).json({ error: 'Error al eliminar plantilla' });
   }
 });
 
@@ -202,7 +296,13 @@ router.post('/:id/aceptar', async (req, res) => {
         nombreProyecto, cliente?.direccion || null, cliente?.mts2 || null,
         JSON.stringify(CLAUSULAS_DEFECTO),
         PARRAFO_INTRODUCTORIO_DEFECTO,
-        cotizacion.condiciones_pago,
+        // Fallback a CONDICIONES_PAGO_DEFECTO (2026-08-26): si por alguna razón la cotización
+        // quedó sin condiciones de pago (columna null/vacía), el contrato no debe nacer con el
+        // campo en blanco en la pantalla "Revisar y editar documento" — siempre debe traer algo
+        // editable, igual que ya se garantiza al crear/editar la cotización misma.
+        cotizacion.condiciones_pago && cotizacion.condiciones_pago.length
+          ? cotizacion.condiciones_pago
+          : JSON.stringify(CONDICIONES_PAGO_DEFECTO),
         cotizacion.tiempo_entrega || TIEMPO_ENTREGA_DEFECTO,
         cotizacion.ciudad || null,
         cotizacion.firmante || null,
@@ -321,8 +421,8 @@ router.put('/:id', async (req, res) => {
   try {
     const { id } = req.params;
     const {
-      numero, items, descuento,
-      propietario, ciudad, saludo, parrafo_contexto, condiciones_pago, tiempo_entrega, firmante,
+      items, descuento,
+      propietario, ciudad, saludo, parrafo_contexto, nombre_proyecto, condiciones_pago, tiempo_entrega, firmante,
     } = req.body;
 
     const cotizacionResult = await client.query('SELECT * FROM cotizaciones WHERE id = $1', [id]);
@@ -335,17 +435,20 @@ router.put('/:id', async (req, res) => {
 
     await client.query('BEGIN');
 
+    // numero ya NO se recibe ni se actualiza aquí (ver calcularSiguienteNumero): una vez asignado
+    // al crear la cotización, es permanente — editar la cotización nunca lo cambia.
     if (items && items.length > 0) {
       const subtotal = items.reduce((sum, item) => sum + parseFloat(item.valor), 0);
       const total = subtotal - (parseFloat(descuento) || 0);
       await client.query(
-        `UPDATE cotizaciones SET numero = $1, total = $2, descuento = $3,
-          propietario = $4, ciudad = $5, saludo = $6, parrafo_contexto = $7, condiciones_pago = $8, tiempo_entrega = $9, firmante = $10,
+        `UPDATE cotizaciones SET total = $1, descuento = $2,
+          propietario = $3, ciudad = $4, saludo = $5, parrafo_contexto = $6, nombre_proyecto = $7, condiciones_pago = $8, tiempo_entrega = $9, firmante = $10,
           updated_at = CURRENT_TIMESTAMP
          WHERE id = $11`,
         [
-          numero || null, total, parseFloat(descuento) || 0,
+          total, parseFloat(descuento) || 0,
           propietario || null, ciudad || null, saludo || SALUDO_DEFECTO, parrafo_contexto || PARRAFO_CONTEXTO_DEFECTO,
+          nombre_proyecto || null,
           JSON.stringify(condiciones_pago && condiciones_pago.length ? condiciones_pago : CONDICIONES_PAGO_DEFECTO),
           tiempo_entrega || TIEMPO_ENTREGA_DEFECTO, firmante || null,
           id,
@@ -358,13 +461,13 @@ router.put('/:id', async (req, res) => {
       }
     } else {
       await client.query(
-        `UPDATE cotizaciones SET numero = $1,
-          propietario = $2, ciudad = $3, saludo = $4, parrafo_contexto = $5, condiciones_pago = $6, tiempo_entrega = $7, firmante = $8,
+        `UPDATE cotizaciones SET
+          propietario = $1, ciudad = $2, saludo = $3, parrafo_contexto = $4, nombre_proyecto = $5, condiciones_pago = $6, tiempo_entrega = $7, firmante = $8,
           updated_at = CURRENT_TIMESTAMP
          WHERE id = $9`,
         [
-          numero || null,
           propietario || null, ciudad || null, saludo || SALUDO_DEFECTO, parrafo_contexto || PARRAFO_CONTEXTO_DEFECTO,
+          nombre_proyecto || null,
           JSON.stringify(condiciones_pago && condiciones_pago.length ? condiciones_pago : CONDICIONES_PAGO_DEFECTO),
           tiempo_entrega || TIEMPO_ENTREGA_DEFECTO, firmante || null,
           id,
@@ -396,7 +499,7 @@ router.put('/:id/items-aceptada', async (req, res) => {
     const { id } = req.params;
     const {
       items, descuento,
-      propietario, ciudad, saludo, parrafo_contexto, condiciones_pago, tiempo_entrega, firmante,
+      propietario, ciudad, nombre_proyecto, saludo, parrafo_contexto, condiciones_pago, tiempo_entrega, firmante,
     } = req.body;
 
     if (!items || items.length === 0) {
@@ -439,16 +542,17 @@ router.put('/:id/items-aceptada', async (req, res) => {
          total = $1, descuento = $2,
          propietario = COALESCE($3, propietario),
          ciudad = COALESCE($4, ciudad),
-         saludo = COALESCE($5, saludo),
-         parrafo_contexto = COALESCE($6, parrafo_contexto),
-         condiciones_pago = COALESCE($7, condiciones_pago),
-         tiempo_entrega = COALESCE($8, tiempo_entrega),
-         firmante = COALESCE($9, firmante),
+         nombre_proyecto = COALESCE($5, nombre_proyecto),
+         saludo = COALESCE($6, saludo),
+         parrafo_contexto = COALESCE($7, parrafo_contexto),
+         condiciones_pago = COALESCE($8, condiciones_pago),
+         tiempo_entrega = COALESCE($9, tiempo_entrega),
+         firmante = COALESCE($10, firmante),
          updated_at = CURRENT_TIMESTAMP
-       WHERE id = $10`,
+       WHERE id = $11`,
       [
         nuevoTotal, descuentoAplicado,
-        propietario ?? null, ciudad ?? null, saludo ?? null, parrafo_contexto ?? null,
+        propietario ?? null, ciudad ?? null, nombre_proyecto ?? null, saludo ?? null, parrafo_contexto ?? null,
         condiciones_pago ? JSON.stringify(condiciones_pago) : null,
         tiempo_entrega ?? null, firmante ?? null,
         id,
@@ -629,10 +733,23 @@ router.delete('/:id', async (req, res) => {
 router.get('/contratos/listar/:empresa_id', async (req, res) => {
   try {
     const { empresa_id } = req.params;
+    // FIX (2026-08-26): un contrato recién aceptado nace SIN proyecto_id (el proyecto se crea
+    // después, a demanda, con el botón "Crear Proyecto" — ver POST /contratos/:id/crear-proyecto).
+    // Antes esta ficha mostraba "Sin proyecto asociado" en TODOS los contratos nuevos porque
+    // proyecto_nombre salía del LEFT JOIN con proyectos (NULL mientras no exista el proyecto
+    // formal). Ahora usamos COALESCE con el snapshot que el contrato ya guarda desde que se creó
+    // (ct.proyecto_nombre_snapshot), así la ficha muestra el nombre del proyecto/casa desde el
+    // primer momento, exista o no el proyecto todavía. También sumamos el nombre del cliente
+    // (vía cotizaciones → clientes) para mostrarlo junto al nombre del proyecto en la ficha.
     const result = await pool.query(
-      `SELECT ct.*, p.nombre AS proyecto_nombre, p.estado AS proyecto_estado
+      `SELECT ct.*,
+              COALESCE(p.nombre, ct.proyecto_nombre_snapshot) AS proyecto_nombre,
+              p.estado AS proyecto_estado,
+              cl.nombre AS cliente_nombre
        FROM contratos ct
        LEFT JOIN proyectos p ON p.id = ct.proyecto_id
+       LEFT JOIN cotizaciones co ON co.id = ct.cotizacion_id
+       LEFT JOIN clientes cl ON cl.id = co.cliente_id
        WHERE ct.empresa_id = $1
        ORDER BY ct.created_at DESC`,
       [empresa_id]
@@ -830,5 +947,6 @@ async function generarYGuardarPdfContrato(cotizacionId, contratoId, proyectoId) 
 
   await pool.query('UPDATE contratos SET pdf_url = $1 WHERE id = $2', [url, contratoId]);
 }
+
 
 module.exports = router;

@@ -30,6 +30,17 @@ const planos3dRoutes = require('./routes/planos3d');
 // proyecto_equipo, causadas por un bug ya corregido. Quitar este require Y la línea app.use de
 // abajo juntos, en el mismo commit, cuando ya no se necesite — ver comentario en mantenimiento.js.
 const mantenimientoRoutes = require('./routes/mantenimiento');
+const { verificarTokenModoObservacion } = require('./middleware/auth');
+
+// Paso 3 de la migración a autenticación real (2026-08-25): validamos el token en TODAS las
+// rutas /api/*, pero en "modo observación" — si falta o es inválido, NO se bloquea la request,
+// solo se registra en el log del servidor (ver middleware/auth.js). Esto es deliberadamente
+// amplio (incluye login/registro, donde todavía no hay token) porque en observación nunca
+// corta nada: solo sirve para medir, con tráfico real, qué porcentaje de requests ya llegan con
+// token antes de pasar al Paso 4 (verificarToken estricto, que si bloqueará). Cuando ese
+// porcentaje sea prácticamente el 100% (o solo falten rutas públicas esperadas como login),
+// se reemplaza esta línea por la versión estricta.
+app.use('/api', verificarTokenModoObservacion);
 
 // Usar rutas
 app.use('/api/proyectos', proyectosRoutes);

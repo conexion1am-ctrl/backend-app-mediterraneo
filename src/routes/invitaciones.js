@@ -3,6 +3,7 @@ const { Pool } = require('pg');
 const bcrypt = require('bcryptjs');
 const router = express.Router();
 require('dotenv').config();
+const { generarToken } = require('../middleware/auth');
 
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
@@ -202,10 +203,16 @@ router.post('/aceptar-por-celular', async (req, res) => {
       [usuario.id]
     );
 
+    // Token de sesión (2026-08-25, Paso 1 de la migración a autenticación real): esta ruta
+    // literalmente loguea a la persona por primera vez (o de nuevo), así que emite token igual
+    // que /api/auth/login — ver middleware/auth.js.
+    const token = generarToken(usuario);
+
     res.json({
       mensaje: 'Invitación aceptada, usuario vinculado exitosamente',
       usuario,
       empresas: rolesResult.rows,
+      token,
     });
   } catch (error) {
     await client.query('ROLLBACK');

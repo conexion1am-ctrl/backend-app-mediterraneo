@@ -3,6 +3,7 @@ const { Pool } = require('pg');
 const bcrypt = require('bcryptjs');
 const router = express.Router();
 require('dotenv').config();
+const { generarToken } = require('../middleware/auth');
 
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
@@ -100,10 +101,16 @@ router.post('/login', async (req, res) => {
     delete usuarioFinal.contraseña_hash;
     const usuarioRespuesta = usuarioFinal;
 
+    // Token de sesión (2026-08-25, Paso 1 de la migración a autenticación real): se agrega como
+    // campo NUEVO, sin quitar nada de lo que ya se devolvía — así una app vieja que todavía no
+    // sepa leer "token" sigue funcionando igual mientras se actualiza. Ver middleware/auth.js.
+    const token = generarToken(usuarioFinal);
+
     res.json({
       mensaje: 'Ingreso exitoso',
       usuario: usuarioRespuesta,
       empresas: rolesResult.rows,
+      token,
     });
   } catch (error) {
     console.error('Error en login:', error);

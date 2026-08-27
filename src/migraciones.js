@@ -305,6 +305,42 @@ async function aplicarMigraciones() {
     await pool.query(`ALTER TABLE contratos ADD COLUMN IF NOT EXISTS firmante VARCHAR(255)`);
     await pool.query(`ALTER TABLE contratos ADD COLUMN IF NOT EXISTS numero VARCHAR(50)`);
 
+    // nombre_proyecto propio de la cotización (2026-08-26, a pedido del usuario): antes este dato
+    // solo existía en clientes.nombre_proyecto. Ahora la cotización guarda su PROPIA copia
+    // (autocompletada desde el cliente al crearla, pero editable solo para esa cotización) para
+    // no alterar el dato original del cliente si el usuario necesita ajustarlo en una cotización
+    // puntual (ej. una segunda etapa del mismo proyecto con un nombre distinto).
+    await pool.query(`ALTER TABLE cotizaciones ADD COLUMN IF NOT EXISTS nombre_proyecto VARCHAR(255)`);
+
+    // Plantillas de cotización (2026-08-26): permiten precargar una cotización nueva con ítems,
+    // párrafo, condiciones de pago, etc. ya definidos, para no reescribir cotizaciones muy
+    // parecidas cada vez. No llevan cliente ni proyecto asociado — solo el "molde" de texto/ítems.
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS plantillas_cotizacion (
+        id SERIAL PRIMARY KEY,
+        empresa_id INT REFERENCES empresas(id),
+        nombre VARCHAR(255) NOT NULL,
+        saludo TEXT,
+        parrafo_contexto TEXT,
+        condiciones_pago JSONB,
+        tiempo_entrega VARCHAR(255),
+        items JSONB NOT NULL,
+        descuento DECIMAL(12, 2) DEFAULT 0,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+
+    // FIX (2026-08-26): proyectos.direccion nació NOT NULL en el esquema original (setup.js),
+    // desde una época en que todo proyecto se creaba manualmente y el usuario siempre tecleaba una
+    // dirección en el formulario. Desde que el proyecto también se crea automáticamente al aceptar
+    // una cotización (POST /contratos/:id/crear-proyecto en cotizaciones_v2.js), la dirección viene
+    // del snapshot del cliente (proyecto_direccion_snapshot) — y como "Dirección" es un campo
+    // OPCIONAL en la ficha de Cliente, ese snapshot puede llegar en NULL perfectamente. El INSERT
+    // en proyectos entonces violaba este NOT NULL y el endpoint fallaba siempre con "no se pudo
+    // crear el proyecto" para cualquier cliente sin dirección registrada. La dirección es un dato
+    // útil pero nunca fue realmente obligatorio para poder operar un proyecto.
+    await pool.query(`ALTER TABLE proyectos ALTER COLUMN direccion DROP NOT NULL`);
+
     console.log('✅ Esquema verificado/actualizado correctamente');
   } catch (error) {
     // No tumbamos el servidor si esto falla: preferimos que la app siga funcionando con el

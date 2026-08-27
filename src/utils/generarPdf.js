@@ -10,6 +10,18 @@ const formatearMoneda = (valor) => {
   return numero.toLocaleString('es-CO', { style: 'currency', currency: 'COP', maximumFractionDigits: 0 });
 };
 
+// La columna "cantidad" es DECIMAL en la base de datos, así que pg siempre la devuelve como
+// string con dos decimales (ej. "1.00", "2.50") aunque el usuario haya escrito un número entero.
+// La app NO maneja decimales salvo que el usuario mismo los escriba a propósito (2026-08-26, a
+// pedido del usuario) — así que si la cantidad es un entero, se muestra sin ".00"; si de verdad
+// tiene decimales (ej. 2.5 metros), se respetan tal cual.
+const formatearCantidad = (valor) => {
+  if (valor == null || valor === '') return '';
+  const numero = parseFloat(valor);
+  if (Number.isNaN(numero)) return valor;
+  return String(numero); // parseFloat+String ya quita los ceros de relleno: "1.00" -> "1", "2.50" -> "2.5"
+};
+
 // Convierte un número entero (pesos colombianos) a su forma en letras, en español, para el
 // bloque "Segunda - Precio" del contrato: "$87.500.000 (Ochenta y siete millones quinientos mil
 // pesos colombianos)". Cubre el rango que puede necesitar un contrato de obra (hasta miles de
@@ -175,7 +187,7 @@ function construirHtmlCotizacion({
 
   const filaItem = (item, index) => `
     <tr style="background:${index % 2 === 0 ? '#fff' : '#f7f7f7'};">
-      <td style="padding:8px 10px; border-bottom:1px solid #eee; text-align:center;">${item.cantidad != null && item.cantidad !== '' ? item.cantidad : '-'}</td>
+      <td style="padding:8px 10px; border-bottom:1px solid #eee; text-align:center;">${item.cantidad != null && item.cantidad !== '' ? formatearCantidad(item.cantidad) : '-'}</td>
       <td style="padding:8px 10px; border-bottom:1px solid #eee;">${item.descripcion || ''}${item.adicional ? ' <span style="color:#888; font-size:11px;">(adicional)</span>' : ''}</td>
       <td style="padding:8px 10px; border-bottom:1px solid #eee; text-align:right;">${formatearMoneda(item.valor)}</td>
     </tr>`;
@@ -370,7 +382,7 @@ function construirHtmlContrato({
 
   const filaItem = (item, index) => `
     <tr style="background:${index % 2 === 0 ? '#fff' : '#f7f7f7'};">
-      <td style="padding:8px 10px; border-bottom:1px solid #eee; text-align:center;">${item.cantidad != null && item.cantidad !== '' ? item.cantidad : '-'}</td>
+      <td style="padding:8px 10px; border-bottom:1px solid #eee; text-align:center;">${item.cantidad != null && item.cantidad !== '' ? formatearCantidad(item.cantidad) : '-'}</td>
       <td style="padding:8px 10px; border-bottom:1px solid #eee;">${item.descripcion || ''}${item.adicional ? ' <span style="color:#888; font-size:11px;">(adicional)</span>' : ''}</td>
       <td style="padding:8px 10px; border-bottom:1px solid #eee; text-align:right;">${formatearMoneda(item.valor)}</td>
     </tr>`;
