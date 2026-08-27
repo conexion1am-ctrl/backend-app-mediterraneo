@@ -300,9 +300,22 @@ router.post('/:id/aceptar', async (req, res) => {
         // quedó sin condiciones de pago (columna null/vacía), el contrato no debe nacer con el
         // campo en blanco en la pantalla "Revisar y editar documento" — siempre debe traer algo
         // editable, igual que ya se garantiza al crear/editar la cotización misma.
-        cotizacion.condiciones_pago && cotizacion.condiciones_pago.length
-          ? cotizacion.condiciones_pago
-          : JSON.stringify(CONDICIONES_PAGO_DEFECTO),
+        //
+        // FIX (2026-08-27, bug reportado: condiciones de pago vacías en el contrato aunque la
+        // cotización sí las tenía): cotizacion.condiciones_pago puede llegar de pg como un array
+        // ya parseado (columna JSONB) o como un string JSON sin parsear, dependiendo de cómo haya
+        // quedado esa columna en la base real. Antes se pasaba tal cual al INSERT sin normalizar
+        // (a diferencia del fallback, que sí llevaba JSON.stringify) — si llegaba como array de
+        // objetos JS, pg podía no serializarlo de forma consistente al guardarlo en la columna
+        // JSONB del contrato, dejándolo vacío o corrupto. Ahora se normaliza siempre a texto JSON
+        // antes de insertar, igual en ambas ramas.
+        (() => {
+          let condPago = cotizacion.condiciones_pago;
+          if (typeof condPago === 'string') {
+            try { condPago = JSON.parse(condPago); } catch (e) { condPago = null; }
+          }
+          return JSON.stringify(Array.isArray(condPago) && condPago.length ? condPago : CONDICIONES_PAGO_DEFECTO);
+        })(),
         cotizacion.tiempo_entrega || TIEMPO_ENTREGA_DEFECTO,
         cotizacion.ciudad || null,
         cotizacion.firmante || null,

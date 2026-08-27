@@ -328,7 +328,14 @@ function parsearClausulas(clausulas) {
   return [];
 }
 
-function clausulasLegalesHtml({ clausulas, total, ciudad, fechaLarga }) {
+// FIX (2026-08-27, a pedido del usuario): la tabla de ítems debe imprimirse justo después de la
+// cláusula "Primera - Objeto" (que termina en "...que consta de la tabla de ítems relacionada a
+// continuación"), no antes de todas las cláusulas ni después de todas. Por eso esta función ahora
+// recibe la lista de cláusulas YA DIVIDIDA en dos tramos desde construirHtmlContrato (antes/después
+// de la tabla) — permite reusar el mismo bloque de estilo/formato de párrafo para ambos tramos sin
+// duplicar código. `incluirCierre` controla si se imprime el párrafo final "En señal de
+// conformidad..." (debe ir una sola vez, al final del segundo tramo).
+function clausulasLegalesHtml({ clausulas, total, ciudad, fechaLarga, incluirCierre = true }) {
   const lista = parsearClausulas(clausulas);
   const esSegundaPrecio = (titulo) => /segunda/i.test(titulo || '') && /precio/i.test(titulo || '');
 
@@ -342,10 +349,14 @@ function clausulasLegalesHtml({ clausulas, total, ciudad, fechaLarga }) {
     })
     .join('\n');
 
+  const cierre = incluirCierre
+    ? `<p>En señal de conformidad las partes contratantes suscriben el presente documento${ciudad ? ` en la Ciudad de ${ciudad}` : ''} siendo el día ${fechaLarga}. Se extienden dos copias del mismo tenor y valor.</p>`
+    : '';
+
   return `
     ${bloques}
 
-    <p>En señal de conformidad las partes contratantes suscriben el presente documento${ciudad ? ` en la Ciudad de ${ciudad}` : ''} siendo el día ${fechaLarga}. Se extienden dos copias del mismo tenor y valor.</p>
+    ${cierre}
   `;
 }
 
@@ -379,6 +390,15 @@ function construirHtmlContrato({
   const direccionInmueble = cliente?.direccion ? `${cliente.direccion}` : '';
   const mts2Texto = cliente?.mts2 ? ` (${cliente.mts2} m²)` : '';
   const totalContrato = total != null ? total : subtotalGeneral;
+
+  // FIX (2026-08-27, a pedido del usuario): la cláusula "Primera - Objeto" dice textualmente
+  // "...que consta de la tabla de ítems relacionada a continuación", así que esa tabla debe
+  // aparecer justo después de ella, no antes de todas las cláusulas ni al final. Se divide el
+  // array de cláusulas en "primera" (siempre la posición 0, ya que CLAUSULAS_DEFECTO y cualquier
+  // edición del usuario mantienen el orden) y "resto" (Segunda en adelante).
+  const listaClausulasCompleta = parsearClausulas(clausulas);
+  const clausulaPrimera = listaClausulasCompleta.slice(0, 1);
+  const clausulasRestantes = listaClausulasCompleta.slice(1);
 
   const filaItem = (item, index) => `
     <tr style="background:${index % 2 === 0 ? '#fff' : '#f7f7f7'};">
@@ -467,6 +487,10 @@ function construirHtmlContrato({
         nombreProyecto: cliente?.nombre_proyecto,
       })}</p>
 
+      <div class="clausulaPrimera">
+        ${clausulasLegalesHtml({ clausulas: clausulaPrimera, total: totalContrato, ciudad, fechaLarga: formatearFechaLarga(fechaContrato), incluirCierre: false })}
+      </div>
+
       ${tablasSecciones}
 
       <table class="resumen">
@@ -490,7 +514,7 @@ function construirHtmlContrato({
       <p>Los dineros deben ser consignados a la Cuenta ${empresa.banco_tipo_cuenta || ''} de ${empresa.banco_nombre || ''} <strong>${empresa.banco_numero}</strong> a nombre de <strong>${empresa.banco_titular || empresa.nombre || ''}</strong>.</p>` : ''}
 
       <div class="clausulas">
-        ${clausulasLegalesHtml({ clausulas, total: totalContrato, ciudad, fechaLarga: formatearFechaLarga(fechaContrato) })}
+        ${clausulasLegalesHtml({ clausulas: clausulasRestantes, total: totalContrato, ciudad, fechaLarga: formatearFechaLarga(fechaContrato), incluirCierre: true })}
       </div>
 
       <div class="firmas">
