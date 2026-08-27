@@ -335,9 +335,48 @@ function parsearClausulas(clausulas) {
 // de la tabla) — permite reusar el mismo bloque de estilo/formato de párrafo para ambos tramos sin
 // duplicar código. `incluirCierre` controla si se imprime el párrafo final "En señal de
 // conformidad..." (debe ir una sola vez, al final del segundo tramo).
-function clausulasLegalesHtml({ clausulas, total, ciudad, fechaLarga, incluirCierre = true }) {
+// 2026-08-27 (a pedido del usuario): tabla de condiciones de pago (Porcentaje | Ítem | Valor) que
+// va INTERCALADA dentro del texto de la cláusula "Tercera - Pago", no como bloque aparte. El
+// "Ítem" es la descripción que el usuario ya escribe en Condiciones de pago (ej. "A la firma del
+// contrato"); el "Valor" se calcula automáticamente como porcentaje% del valor total del contrato
+// — nunca se pide ni se guarda por separado, para que nunca quede desincronizado del total real.
+function tablaCondicionesPagoHtml(condiciones, total) {
+  const lista = Array.isArray(condiciones) ? condiciones.filter((c) => c.porcentaje || c.descripcion) : [];
+  if (!lista.length) return '';
+  const totalNumero = parseFloat(total) || 0;
+  const filas = lista
+    .map((c) => {
+      const porcentaje = parseFloat(c.porcentaje) || 0;
+      const valorFila = totalNumero * (porcentaje / 100);
+      return `
+        <tr>
+          <td style="padding:6px 10px; border-bottom:1px solid #eee; text-align:center;">${porcentaje}%</td>
+          <td style="padding:6px 10px; border-bottom:1px solid #eee;">${c.descripcion || ''}</td>
+          <td style="padding:6px 10px; border-bottom:1px solid #eee; text-align:right;">${formatearMoneda(valorFila)}</td>
+        </tr>`;
+    })
+    .join('');
+  return `
+    <table style="width:100%; border-collapse:collapse; margin:10px 0;">
+      <thead>
+        <tr>
+          <th style="text-align:center; background:#f2f2f2; padding:6px 10px; font-size:12px; border-bottom:2px solid #ccc;">Porcentaje</th>
+          <th style="text-align:left; background:#f2f2f2; padding:6px 10px; font-size:12px; border-bottom:2px solid #ccc;">Ítem</th>
+          <th style="text-align:right; background:#f2f2f2; padding:6px 10px; font-size:12px; border-bottom:2px solid #ccc;">Valor</th>
+        </tr>
+      </thead>
+      <tbody>${filas}</tbody>
+    </table>`;
+}
+
+// Frase exacta (ver CLAUSULAS_DEFECTO en cotizaciones_v2.js) que marca dónde debe cortarse el
+// texto de la cláusula "Tercera - Pago" para intercalar la tabla justo después.
+const FRASE_CORTE_TERCERA_PAGO = 'estipulándose el modo de pago de la siguiente manera.';
+
+function clausulasLegalesHtml({ clausulas, total, ciudad, fechaLarga, incluirCierre = true, condicionesPago }) {
   const lista = parsearClausulas(clausulas);
   const esSegundaPrecio = (titulo) => /segunda/i.test(titulo || '') && /precio/i.test(titulo || '');
+  const esTerceraPago = (titulo) => /tercera/i.test(titulo || '') && /pago/i.test(titulo || '');
 
   const bloques = lista
     .map((c) => {
@@ -345,6 +384,18 @@ function clausulasLegalesHtml({ clausulas, total, ciudad, fechaLarga, incluirCie
       const valorEnLetras = esSegundaPrecio(c.titulo) && total != null
         ? `<br/>${formatearMoneda(total)} (${numeroALetras(total)})`
         : '';
+
+      if (esTerceraPago(c.titulo) && condicionesPago) {
+        const indiceCorte = (c.texto || '').indexOf(FRASE_CORTE_TERCERA_PAGO);
+        if (indiceCorte !== -1) {
+          const finCorte = indiceCorte + FRASE_CORTE_TERCERA_PAGO.length;
+          const antes = (c.texto || '').slice(0, finCorte).replace(/\n/g, '<br/>');
+          const despues = (c.texto || '').slice(finCorte).trim().replace(/\n/g, '<br/>');
+          const tabla = tablaCondicionesPagoHtml(condicionesPago, total);
+          return `<p><strong>${c.titulo || ''}.</strong> ${antes}</p>${tabla}${despues ? `<p>${despues}</p>` : ''}`;
+        }
+      }
+
       return `<p><strong>${c.titulo || ''}.</strong> ${textoConSaltos}${valorEnLetras}</p>`;
     })
     .join('\n');
@@ -388,7 +439,10 @@ function construirHtmlContrato({
   const condiciones = parsearCondicionesPago(condicionesPago);
   const fechaContrato = fecha || new Date();
   const direccionInmueble = cliente?.direccion ? `${cliente.direccion}` : '';
-  const mts2Texto = cliente?.mts2 ? ` (${cliente.mts2} m²)` : '';
+  // FIX (2026-08-27): clientes.mts2 es DECIMAL(10,2) — pg lo devuelve como string con decimales
+  // (ej. "180.00"). Sin normalizar, el párrafo introductorio del contrato (documento legal)
+  // mostraba "(180.00 m²)" en vez de "(180 m²)".
+  const mts2Texto = cliente?.mts2 ? ` (${parseFloat(cliente.mts2)} m²)` : '';
   const totalContrato = total != null ? total : subtotalGeneral;
 
   // FIX (2026-08-27, a pedido del usuario): la cláusula "Primera - Objeto" dice textualmente
@@ -502,10 +556,9 @@ function construirHtmlContrato({
         </tbody>
       </table>
 
-      ${(condiciones && condiciones.length) || tiempoEntrega ? `
+      ${tiempoEntrega ? `
       <div class="condiciones">
-        ${condiciones && condiciones.length ? `<p><strong>Condiciones de pago:</strong></p>${listaCondicionesPago(condiciones)}` : ''}
-        ${tiempoEntrega ? `<p><strong>Tiempo de entrega:</strong> ${tiempoEntrega}</p>` : ''}
+        <p><strong>Tiempo de entrega:</strong> ${tiempoEntrega}</p>
       </div>` : ''}
 
       ${fechaEntrega ? `<p><strong>Fecha de entrega estimada:</strong> ${formatearFechaDdMmAa(fechaEntrega)}</p>` : ''}
@@ -514,7 +567,7 @@ function construirHtmlContrato({
       <p>Los dineros deben ser consignados a la Cuenta ${empresa.banco_tipo_cuenta || ''} de ${empresa.banco_nombre || ''} <strong>${empresa.banco_numero}</strong> a nombre de <strong>${empresa.banco_titular || empresa.nombre || ''}</strong>.</p>` : ''}
 
       <div class="clausulas">
-        ${clausulasLegalesHtml({ clausulas: clausulasRestantes, total: totalContrato, ciudad, fechaLarga: formatearFechaLarga(fechaContrato), incluirCierre: true })}
+        ${clausulasLegalesHtml({ clausulas: clausulasRestantes, total: totalContrato, ciudad, fechaLarga: formatearFechaLarga(fechaContrato), incluirCierre: true, condicionesPago: condiciones })}
       </div>
 
       <div class="firmas">
