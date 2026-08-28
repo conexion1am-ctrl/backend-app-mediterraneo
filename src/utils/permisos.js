@@ -33,9 +33,18 @@ async function esGerencia(usuario_id, empresa_id) {
   return area === 'GERENCIA';
 }
 
+// true si el usuario tiene, en esa empresa, rol de GERENCIA o AREA ADMINISTRATIVA.
+// (2026-08-28, a pedido del usuario): antes solo Gerencia podía eliminar proyectos (ver
+// esGerencia arriba); Administrativa pidió la misma facultad. Función aparte para no tocar el
+// sentido estricto de esGerencia, que otros endpoints siguen usando tal cual.
+async function puedeEliminarProyectos(usuario_id, empresa_id) {
+  const area = await areaDeUsuarioEnEmpresa(usuario_id, empresa_id);
+  return area === 'GERENCIA' || area === 'AREA ADMINISTRATIVA';
+}
+
 // true si el área (por nombre) tiene permiso para eliminar clientes.
 function puedeEliminarClientes(area_nombre) {
   return !!PERMISOS_POR_AREA[area_nombre]?.eliminarClientes;
 }
 
-module.exports = { areaDeUsuarioEnEmpresa, esGerencia, puedeEliminarClientes };
+module.exports = { areaDeUsuarioEnEmpresa, esGerencia, puedeEliminarClientes, puedeEliminarProyectos };

@@ -2,7 +2,7 @@ const express = require('express');
 const { Pool } = require('pg');
 const router = express.Router();
 require('dotenv').config();
-const { esGerencia } = require('../utils/permisos');
+const { puedeEliminarProyectos } = require('../utils/permisos');
 const { borrarArchivoDeStorage } = require('../utils/firebaseAdmin');
 const { borrarDependenciasDeProyecto, borrarDependenciasDeArea, configurarProyectoNuevo } = require('../utils/cascadaProyecto');
 const { vaciarChat } = require('./mensajes');
@@ -460,9 +460,9 @@ router.delete('/:id', async (req, res) => {
     const proyecto = proyectoResult.rows[0];
 
     if (usuario_id) {
-      const esGerenciaDeEstaEmpresa = await esGerencia(usuario_id, proyecto.empresa_id);
-      if (!esGerenciaDeEstaEmpresa) {
-        return res.status(403).json({ error: 'Solo Gerencia puede eliminar proyectos' });
+      const puedeEliminar = await puedeEliminarProyectos(usuario_id, proyecto.empresa_id);
+      if (!puedeEliminar) {
+        return res.status(403).json({ error: 'Solo Gerencia o Área Administrativa pueden eliminar proyectos' });
       }
     }
 
@@ -498,7 +498,10 @@ router.delete('/:id', async (req, res) => {
   } catch (error) {
     await client.query('ROLLBACK');
     console.error('Error eliminando proyecto:', error.message, '| code:', error.code, '| detail:', error.detail, '| constraint:', error.constraint, '| table:', error.table);
-    res.status(500).json({ error: 'No se pudo eliminar el proyecto. Intenta de nuevo.' });
+    // TEMPORAL (2026-08-28): detalle real en la respuesta solo para diagnosticar el bug
+    // reportado ("proyectos creados desde contrato no se pueden eliminar"). Revertir a mensaje
+    // genérico una vez identificada y arreglada la causa real.
+    res.status(500).json({ error: `No se pudo eliminar el proyecto. Detalle: ${error.message} | constraint: ${error.constraint} | table: ${error.table}` });
   } finally {
     client.release();
   }
