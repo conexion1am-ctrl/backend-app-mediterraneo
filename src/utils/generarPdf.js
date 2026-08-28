@@ -340,7 +340,13 @@ function parsearClausulas(clausulas) {
 // "Ítem" es la descripción que el usuario ya escribe en Condiciones de pago (ej. "A la firma del
 // contrato"); el "Valor" se calcula automáticamente como porcentaje% del valor total del contrato
 // — nunca se pide ni se guarda por separado, para que nunca quede desincronizado del total real.
-function tablaCondicionesPagoHtml(condiciones, total) {
+// FIX (2026-08-28, a pedido del usuario): esta tabla usaba background gris claro (#f2f2f2) en sus
+// <th>, pero heredaba color:#fff del estilo global `th { background:${colorEmpresa}; color:#fff; }`
+// (ver más abajo, en el CSS del documento) — texto blanco sobre fondo gris claro, invisible. La
+// tabla de ítems (Cantidad/Descripción/Valor) se ve bien porque SÍ usa el color de la empresa como
+// fondo de cabecera; esta tabla ahora hace exactamente lo mismo, recibiendo colorEmpresa como
+// parámetro en vez de un gris fijo que no combinaba con el resto del documento.
+function tablaCondicionesPagoHtml(condiciones, total, colorEmpresa) {
   const lista = Array.isArray(condiciones) ? condiciones.filter((c) => c.porcentaje || c.descripcion) : [];
   if (!lista.length) return '';
   const totalNumero = parseFloat(total) || 0;
@@ -360,9 +366,9 @@ function tablaCondicionesPagoHtml(condiciones, total) {
     <table style="width:100%; border-collapse:collapse; margin:10px 0;">
       <thead>
         <tr>
-          <th style="text-align:center; background:#f2f2f2; padding:6px 10px; font-size:12px; border-bottom:2px solid #ccc;">Porcentaje</th>
-          <th style="text-align:left; background:#f2f2f2; padding:6px 10px; font-size:12px; border-bottom:2px solid #ccc;">Ítem</th>
-          <th style="text-align:right; background:#f2f2f2; padding:6px 10px; font-size:12px; border-bottom:2px solid #ccc;">Valor</th>
+          <th style="text-align:center; background:${colorEmpresa}; color:#fff; padding:6px 10px; font-size:12px;">Porcentaje</th>
+          <th style="text-align:left; background:${colorEmpresa}; color:#fff; padding:6px 10px; font-size:12px;">Ítem</th>
+          <th style="text-align:right; background:${colorEmpresa}; color:#fff; padding:6px 10px; font-size:12px;">Valor</th>
         </tr>
       </thead>
       <tbody>${filas}</tbody>
@@ -373,7 +379,7 @@ function tablaCondicionesPagoHtml(condiciones, total) {
 // texto de la cláusula "Tercera - Pago" para intercalar la tabla justo después.
 const FRASE_CORTE_TERCERA_PAGO = 'estipulándose el modo de pago de la siguiente manera.';
 
-function clausulasLegalesHtml({ clausulas, total, ciudad, fechaLarga, incluirCierre = true, condicionesPago }) {
+function clausulasLegalesHtml({ clausulas, total, ciudad, fechaLarga, incluirCierre = true, condicionesPago, colorEmpresa }) {
   const lista = parsearClausulas(clausulas);
   const esSegundaPrecio = (titulo) => /segunda/i.test(titulo || '') && /precio/i.test(titulo || '');
   const esTerceraPago = (titulo) => /tercera/i.test(titulo || '') && /pago/i.test(titulo || '');
@@ -391,7 +397,7 @@ function clausulasLegalesHtml({ clausulas, total, ciudad, fechaLarga, incluirCie
           const finCorte = indiceCorte + FRASE_CORTE_TERCERA_PAGO.length;
           const antes = (c.texto || '').slice(0, finCorte).replace(/\n/g, '<br/>');
           const despues = (c.texto || '').slice(finCorte).trim().replace(/\n/g, '<br/>');
-          const tabla = tablaCondicionesPagoHtml(condicionesPago, total);
+          const tabla = tablaCondicionesPagoHtml(condicionesPago, total, colorEmpresa || '#1E90FF');
           return `<p><strong>${c.titulo || ''}.</strong> ${antes}</p>${tabla}${despues ? `<p>${despues}</p>` : ''}`;
         }
       }
@@ -542,7 +548,7 @@ function construirHtmlContrato({
       })}</p>
 
       <div class="clausulaPrimera">
-        ${clausulasLegalesHtml({ clausulas: clausulaPrimera, total: totalContrato, ciudad, fechaLarga: formatearFechaLarga(fechaContrato), incluirCierre: false })}
+        ${clausulasLegalesHtml({ clausulas: clausulaPrimera, total: totalContrato, ciudad, fechaLarga: formatearFechaLarga(fechaContrato), incluirCierre: false, colorEmpresa })}
       </div>
 
       ${tablasSecciones}
@@ -567,7 +573,7 @@ function construirHtmlContrato({
       <p>Los dineros deben ser consignados a la Cuenta ${empresa.banco_tipo_cuenta || ''} de ${empresa.banco_nombre || ''} <strong>${empresa.banco_numero}</strong> a nombre de <strong>${empresa.banco_titular || empresa.nombre || ''}</strong>.</p>` : ''}
 
       <div class="clausulas">
-        ${clausulasLegalesHtml({ clausulas: clausulasRestantes, total: totalContrato, ciudad, fechaLarga: formatearFechaLarga(fechaContrato), incluirCierre: true, condicionesPago: condiciones })}
+        ${clausulasLegalesHtml({ clausulas: clausulasRestantes, total: totalContrato, ciudad, fechaLarga: formatearFechaLarga(fechaContrato), incluirCierre: true, condicionesPago: condiciones, colorEmpresa })}
       </div>
 
       <div class="firmas">
