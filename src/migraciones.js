@@ -341,6 +341,111 @@ async function aplicarMigraciones() {
     // útil pero nunca fue realmente obligatorio para poder operar un proyecto.
     await pool.query(`ALTER TABLE proyectos ALTER COLUMN direccion DROP NOT NULL`);
 
+    // BLINDAJE de estadisticas_proyecto (2026-08-28, a pedido explícito del usuario): la ficha
+    // financiera de un proyecto (costos, abonos, utilidad) NUNCA debe desaparecer, ni siquiera si
+    // el proyecto, el contrato o la cotización que lo originaron se eliminan — se necesita para
+    // sacar balances y resúmenes financieros después. Antes, borrarDependenciasDeProyecto (ver
+    // cascadaProyecto.js) borraba estadisticas_proyecto y abonos_proyecto junto con el proyecto;
+    // eso ya se quitó de ahí, y en su lugar esta ficha se marca como "huérfana" (proyecto_id sigue
+    // apuntando a un proyecto que ya no existe) usando estos snapshots para poder mostrarla igual.
+    // Solo GERENCIA puede borrar una ficha de Estadísticas de forma explícita y directa (nuevo
+    // endpoint DELETE /estadisticas/:proyecto_id), nunca como efecto secundario de otra acción.
+    await pool.query(`ALTER TABLE estadisticas_proyecto ADD COLUMN IF NOT EXISTS proyecto_nombre_snapshot VARCHAR(255)`);
+    await pool.query(`ALTER TABLE estadisticas_proyecto ADD COLUMN IF NOT EXISTS cliente_nombre_snapshot VARCHAR(255)`);
+    await pool.query(`ALTER TABLE estadisticas_proyecto ADD COLUMN IF NOT EXISTS proyecto_eliminado BOOLEAN NOT NULL DEFAULT false`);
+    // empresa_id propio (no derivado de proyecto_id): necesario para poder listar las fichas
+    // huérfanas (proyecto ya eliminado) de una empresa en la pantalla de Estadísticas — una vez
+    // que el proyecto se borra, ya no hay forma de saber a qué empresa pertenecía sin este dato
+    // guardado aparte. Se rellena retroactivamente para las fichas ya existentes (JOIN a
+    // proyectos, que todavía existe para ellas porque no han sido eliminadas) y de ahí en adelante
+    // se guarda siempre al crear la ficha (ver POST cotizaciones_v2.js aceptar cotización).
+    await pool.query(`ALTER TABLE estadisticas_proyecto ADD COLUMN IF NOT EXISTS empresa_id INT`);
+    await pool.query(`
+      UPDATE estadisticas_proyecto ep
+      SET empresa_id = p.empresa_id
+      FROM proyectos p
+      WHERE ep.proyecto_id = p.id AND ep.empresa_id IS NULL
+    `);
+    // Por si alguna vez estadisticas_proyecto.proyecto_id tuvo una FK con ON DELETE CASCADE hecha
+    // a mano en producción (fuera de estos archivos de migración versionados — patrón de drift ya
+    // conocido en este proyecto): la buscamos por nombre real y, si existe, la reemplazamos por
+    // ON DELETE SET NULL. Así, aunque el proyecto se borre, la fila de estadísticas sobrevive
+    // (proyecto_id queda NULL en vez de que la fila entera se borre en cascada).
+    await pool.query(`ALTER TABLE estadisticas_proyecto ALTER COLUMN proyecto_id DROP NOT NULL`);
+    await pool.query(`
+      DO $$
+      DECLARE nombre_fk TEXT;
+      BEGIN
+        SELECT tc.constraint_name INTO nombre_fk
+        FROM information_schema.table_constraints tc
+        JOIN information_schema.key_column_usage kcu ON kcu.constraint_name = tc.constraint_name
+        WHERE tc.table_name = 'estadisticas_proyecto' AND tc.constraint_type = 'FOREIGN KEY' AND kcu.column_name = 'proyecto_id'
+        LIMIT 1;
+
+        IF nombre_fk IS NOT NULL THEN
+          EXECUTE format('ALTER TABLE estadisticas_proyecto DROP CONSTRAINT %I', nombre_fk);
+        END IF;
+
+        IF NOT EXISTS (
+          SELECT 1 FROM information_schema.table_constraints
+          WHERE constraint_name = 'estadisticas_proyecto_proyecto_id_set_null'
+        ) THEN
+          ALTER TABLE estadisticas_proyecto ADD CONSTRAINT estadisticas_proyecto_proyecto_id_set_null
+            FOREIGN KEY (proyecto_id) REFERENCES proyectos(id) ON DELETE SET NULL;
+        END IF;
+      END $$;
+    `);
+    // Mismo blindaje para abonos_proyecto: los abonos ya registrados tampoco deben perderse.
+    await pool.query(`ALTER TABLE abonos_proyecto ALTER COLUMN proyecto_id DROP NOT NULL`);
+    await pool.query(`
+      DO $$
+      DECLARE nombre_fk TEXT;
+      BEGIN
+        SELECT tc.constraint_name INTO nombre_fk
+        FROM information_schema.table_constraints tc
+        JOIN information_schema.key_column_usage kcu ON kcu.constraint_name = tc.constraint_name
+        WHERE tc.table_name = 'abonos_proyecto' AND tc.constraint_type = 'FOREIGN KEY' AND kcu.column_name = 'proyecto_id'
+        LIMIT 1;
+
+        IF nombre_fk IS NOT NULL THEN
+          EXECUTE format('ALTER TABLE abonos_proyecto DROP CONSTRAINT %I', nombre_fk);
+        END IF;
+
+        IF NOT EXISTS (
+          SELECT 1 FROM information_schema.table_constraints
+          WHERE constraint_name = 'abonos_proyecto_proyecto_id_set_null'
+        ) THEN
+          ALTER TABLE abonos_proyecto ADD CONSTRAINT abonos_proyecto_proyecto_id_set_null
+            FOREIGN KEY (proyecto_id) REFERENCES proyectos(id) ON DELETE SET NULL;
+        END IF;
+      END $$;
+    `);
+    // Y para movimientos_costos (el historial día a día de compras/pagos que compone los totales).
+    await pool.query(`ALTER TABLE movimientos_costos ALTER COLUMN proyecto_id DROP NOT NULL`);
+    await pool.query(`
+      DO $$
+      DECLARE nombre_fk TEXT;
+      BEGIN
+        SELECT tc.constraint_name INTO nombre_fk
+        FROM information_schema.table_constraints tc
+        JOIN information_schema.key_column_usage kcu ON kcu.constraint_name = tc.constraint_name
+        WHERE tc.table_name = 'movimientos_costos' AND tc.constraint_type = 'FOREIGN KEY' AND kcu.column_name = 'proyecto_id'
+        LIMIT 1;
+
+        IF nombre_fk IS NOT NULL THEN
+          EXECUTE format('ALTER TABLE movimientos_costos DROP CONSTRAINT %I', nombre_fk);
+        END IF;
+
+        IF NOT EXISTS (
+          SELECT 1 FROM information_schema.table_constraints
+          WHERE constraint_name = 'movimientos_costos_proyecto_id_set_null'
+        ) THEN
+          ALTER TABLE movimientos_costos ADD CONSTRAINT movimientos_costos_proyecto_id_set_null
+            FOREIGN KEY (proyecto_id) REFERENCES proyectos(id) ON DELETE SET NULL;
+        END IF;
+      END $$;
+    `);
+
     console.log('✅ Esquema verificado/actualizado correctamente');
   } catch (error) {
     // No tumbamos el servidor si esto falla: preferimos que la app siga funcionando con el

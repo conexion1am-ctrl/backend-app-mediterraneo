@@ -442,11 +442,13 @@ router.put('/:id/reactivar', async (req, res) => {
 });
 
 // 🗑️ ELIMINAR proyecto de verdad (ya no es soft-delete), junto con todo lo que cuelga de él
-// (fotos, planos 3D, chat y adjuntos, equipo asignado, estadísticas, abonos, actividades),
-// limpiando también los archivos en Firebase Storage. El CONTRATO y la COTIZACIÓN que lo
-// originaron NO se tocan: solo se desvinculan (proyecto_id = NULL), porque el contrato ya
-// guarda su propio snapshot del proyecto y puede volver a crearlo con "Crear Proyecto" cuando
-// se necesite. Solo Gerencia puede eliminar proyectos.
+// (fotos, planos 3D, chat y adjuntos, equipo asignado, actividades), limpiando también los
+// archivos en Firebase Storage. El CONTRATO y la COTIZACIÓN que lo originaron NO se tocan: solo
+// se desvinculan (proyecto_id = NULL), porque el contrato ya guarda su propio snapshot del
+// proyecto y puede volver a crearlo con "Crear Proyecto" cuando se necesite. La ficha de
+// ESTADÍSTICAS (costos, abonos) tampoco se borra — queda marcada como huérfana con su propio
+// snapshot (ver borrarDependenciasDeProyecto en cascadaProyecto.js), porque se necesita para
+// balances financieros después. Gerencia y Área Administrativa pueden eliminar proyectos.
 router.delete('/:id', async (req, res) => {
   const client = await pool.connect();
   try {

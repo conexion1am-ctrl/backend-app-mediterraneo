@@ -33,11 +33,28 @@ async function borrarDependenciasDeProyecto(client, proyectoId) {
   await client.query('DELETE FROM fotos_avance WHERE proyecto_id = $1', [proyectoId]);
   await client.query('DELETE FROM planos_3d WHERE proyecto_id = $1', [proyectoId]);
   await client.query('DELETE FROM proyecto_equipo WHERE proyecto_id = $1', [proyectoId]);
-  await client.query('DELETE FROM estadisticas_proyecto WHERE proyecto_id = $1', [proyectoId]);
-  // Abonos registrados en la pestaña de Estadísticas del proyecto, y las actividades/checklist
-  // por área (proyecto_actividades) — ambas tablas también cuelgan de proyecto_id y deben
-  // limpiarse antes de poder borrar el proyecto.
-  await client.query('DELETE FROM abonos_proyecto WHERE proyecto_id = $1', [proyectoId]);
+  // estadisticas_proyecto, abonos_proyecto y movimientos_costos NO se borran aquí (2026-08-28, a
+  // pedido explícito del usuario): la ficha financiera de un proyecto debe sobrevivir SIEMPRE,
+  // incluso si el proyecto/contrato/cliente que la originaron se eliminan, porque se necesita para
+  // sacar balances y resúmenes financieros después. En vez de borrar, marcamos la ficha como
+  // huérfana (proyecto_eliminado = true) y guardamos un snapshot del nombre para poder seguir
+  // mostrándola en la pantalla de Estadísticas. La única forma de borrar esta ficha de verdad es
+  // el endpoint DELETE /estadisticas/:proyecto_id, exclusivo de GERENCIA (ver estadisticas.js).
+  const proyectoInfo = await client.query(
+    'SELECT nombre, cliente_nombre_snapshot FROM proyectos WHERE id = $1',
+    [proyectoId]
+  );
+  if (proyectoInfo.rows.length > 0) {
+    const { nombre, cliente_nombre_snapshot } = proyectoInfo.rows[0];
+    await client.query(
+      `UPDATE estadisticas_proyecto
+       SET proyecto_eliminado = true, proyecto_nombre_snapshot = $1, cliente_nombre_snapshot = $2, updated_at = CURRENT_TIMESTAMP
+       WHERE proyecto_id = $3`,
+      [nombre, cliente_nombre_snapshot || null, proyectoId]
+    );
+  }
+  // Las actividades/checklist por área (proyecto_actividades) sí se limpian: son de gestión de
+  // obra en curso, no del registro financiero, y no tiene sentido conservarlas sin el proyecto.
   await client.query('DELETE FROM proyecto_actividades WHERE proyecto_id = $1', [proyectoId]);
 
   // Cualquier cotización que apunte a este proyecto (aceptada o no) se desvincula en vez de

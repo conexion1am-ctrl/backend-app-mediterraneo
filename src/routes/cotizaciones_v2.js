@@ -421,8 +421,8 @@ router.post('/contratos/:id/crear-proyecto', async (req, res) => {
     const estadisticasExistentes = await client.query('SELECT id FROM estadisticas_proyecto WHERE proyecto_id = $1', [proyecto.id]);
     if (estadisticasExistentes.rows.length === 0) {
       await client.query(
-        'INSERT INTO estadisticas_proyecto (proyecto_id, valor_contrato) VALUES ($1, $2)',
-        [proyecto.id, contrato.valor_total]
+        'INSERT INTO estadisticas_proyecto (proyecto_id, valor_contrato, empresa_id) VALUES ($1, $2, $3)',
+        [proyecto.id, contrato.valor_total, contrato.empresa_id]
       );
     }
 

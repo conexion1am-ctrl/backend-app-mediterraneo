@@ -4,6 +4,7 @@ const router = express.Router();
 require('dotenv').config();
 const { generarExcelFinancieroBuffer } = require('../utils/generarExcelFinanciero');
 const { subirBufferAStorage, borrarArchivoDeStorage } = require('../utils/firebaseAdmin');
+const { esGerencia } = require('../utils/permisos');
 
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
@@ -60,6 +61,34 @@ async function obtenerEstadisticasProyecto(proyecto_id) {
   };
 }
 
+// 👁️ LISTAR proyectos para la pantalla de Estadísticas: los proyectos activos de la empresa
+// (igual que GET /proyectos/listar/:empresa_id) MÁS las fichas "huérfanas" (proyecto_eliminado =
+// true) — proyectos que ya fueron borrados pero cuya ficha financiera se conserva siempre (ver
+// borrarDependenciasDeProyecto en cascadaProyecto.js). Se define ANTES de GET /:proyecto_id a
+// propósito, para que Express no confunda "proyectos-lista" con un proyecto_id.
+router.get('/proyectos-lista/:empresa_id', async (req, res) => {
+  try {
+    const { empresa_id } = req.params;
+
+    const activosResult = await pool.query(
+      "SELECT id, nombre, cliente_nombre_snapshot, false AS proyecto_eliminado FROM proyectos WHERE empresa_id = $1 AND estado = 'activo' ORDER BY created_at DESC",
+      [empresa_id]
+    );
+    const huerfanosResult = await pool.query(
+      `SELECT proyecto_id AS id, proyecto_nombre_snapshot AS nombre, cliente_nombre_snapshot, true AS proyecto_eliminado
+       FROM estadisticas_proyecto
+       WHERE empresa_id = $1 AND proyecto_eliminado = true
+       ORDER BY updated_at DESC`,
+      [empresa_id]
+    );
+
+    res.json({ proyectos: [...activosResult.rows, ...huerfanosResult.rows] });
+  } catch (error) {
+    console.error('Error listando proyectos para Estadísticas:', error);
+    res.status(500).json({ error: 'Error al listar proyectos' });
+  }
+});
+
 // 👁️ VER estadísticas de un proyecto (incluye utilidad calculada, el historial de movimientos
 // de costos agrupado por tipo: materiales, mano_obra, imprevistos, y un resumen por CATEGORÍA
 // -carpintería, ferretería, estuco, etc- que suma materiales + mano de obra + imprevistos de
@@ -90,17 +119,37 @@ router.get('/:proyecto_id/excel', async (req, res) => {
       return res.status(404).json({ error: 'No hay estadísticas para este proyecto todavía' });
     }
 
-    const proyectoResult = await pool.query(
-      `SELECT p.nombre AS proyecto_nombre, e.nombre AS empresa_nombre
-       FROM proyectos p
-       JOIN empresas e ON e.id = p.empresa_id
-       WHERE p.id = $1`,
-      [proyecto_id]
-    );
-    if (proyectoResult.rows.length === 0) {
-      return res.status(404).json({ error: 'Proyecto no encontrado' });
+    // Si el proyecto ya fue eliminado (ver proyecto_eliminado, blindaje 2026-08-28), ya no existe
+    // en la tabla proyectos — usamos el snapshot guardado en estadisticas_proyecto en vez de un
+    // JOIN que fallaría. El nombre de la empresa sí se busca aparte porque empresa_id nunca se
+    // borra (la empresa siempre existe mientras el usuario esté generando este reporte).
+    let proyecto_nombre;
+    let empresa_nombre;
+    if (stats.proyecto_eliminado) {
+      proyecto_nombre = stats.proyecto_nombre_snapshot || 'Proyecto eliminado';
+      // El proyecto ya no existe, así que no podemos llegar a la empresa vía JOIN a proyectos —
+      // el frontend manda empresa_id como query param en este caso (ver EstadisticasScreen.tsx),
+      // ya que lo tiene disponible en la sesión de todas formas.
+      const { empresa_id } = req.query;
+      if (empresa_id) {
+        const empresaResult = await pool.query('SELECT nombre FROM empresas WHERE id = $1', [empresa_id]);
+        empresa_nombre = empresaResult.rows[0]?.nombre || '';
+      } else {
+        empresa_nombre = '';
+      }
+    } else {
+      const proyectoResult = await pool.query(
+        `SELECT p.nombre AS proyecto_nombre, e.nombre AS empresa_nombre
+         FROM proyectos p
+         JOIN empresas e ON e.id = p.empresa_id
+         WHERE p.id = $1`,
+        [proyecto_id]
+      );
+      if (proyectoResult.rows.length === 0) {
+        return res.status(404).json({ error: 'Proyecto no encontrado' });
+      }
+      ({ proyecto_nombre, empresa_nombre } = proyectoResult.rows[0]);
     }
-    const { proyecto_nombre, empresa_nombre } = proyectoResult.rows[0];
 
     const buffer = await generarExcelFinancieroBuffer({
       proyectoNombre: proyecto_nombre,
@@ -216,6 +265,15 @@ router.post('/:proyecto_id/movimiento', async (req, res) => {
 
     await client.query('BEGIN');
 
+    // Solo lectura si el proyecto ya fue eliminado (2026-08-28, a pedido del usuario): la ficha
+    // financiera sobrevive para consulta, pero nadie puede seguir registrando movimientos nuevos
+    // en un proyecto que ya no existe.
+    const fichaActual = await client.query('SELECT proyecto_eliminado FROM estadisticas_proyecto WHERE proyecto_id = $1', [proyecto_id]);
+    if (fichaActual.rows.length > 0 && fichaActual.rows[0].proyecto_eliminado) {
+      await client.query('ROLLBACK');
+      return res.status(403).json({ error: 'Este proyecto fue eliminado — su ficha de Estadísticas es de solo lectura' });
+    }
+
     const movimiento = await client.query(
       'INSERT INTO movimientos_costos (proyecto_id, tipo, detalle, valor, fecha, categoria_id) VALUES ($1, $2, $3, $4, COALESCE($5, CURRENT_DATE), $6) RETURNING *',
       [proyecto_id, tipo, detalle || null, valor, fecha || null, categoria_id || null]
@@ -272,6 +330,12 @@ router.put('/movimiento/:id', async (req, res) => {
     const columnaVieja = movimientoViejo.tipo === 'materiales' ? 'costos_materiales' : movimientoViejo.tipo === 'mano_obra' ? 'valor_mano_obra' : 'valor_imprevistos';
     const columnaNueva = tipo === 'materiales' ? 'costos_materiales' : tipo === 'mano_obra' ? 'valor_mano_obra' : 'valor_imprevistos';
 
+    // Solo lectura si el proyecto ya fue eliminado (ver comentario en POST /:proyecto_id/movimiento).
+    const fichaActual = await client.query('SELECT proyecto_eliminado FROM estadisticas_proyecto WHERE proyecto_id = $1', [movimientoViejo.proyecto_id]);
+    if (fichaActual.rows.length > 0 && fichaActual.rows[0].proyecto_eliminado) {
+      return res.status(403).json({ error: 'Este proyecto fue eliminado — su ficha de Estadísticas es de solo lectura' });
+    }
+
     await client.query('BEGIN');
 
     // Revierte el valor viejo de su columna original.
@@ -316,6 +380,12 @@ router.delete('/movimiento/:id', async (req, res) => {
     const movimiento = movimientoResult.rows[0];
     const columna = movimiento.tipo === 'materiales' ? 'costos_materiales' : movimiento.tipo === 'mano_obra' ? 'valor_mano_obra' : 'valor_imprevistos';
 
+    // Solo lectura si el proyecto ya fue eliminado (ver comentario en POST /:proyecto_id/movimiento).
+    const fichaActual = await client.query('SELECT proyecto_eliminado FROM estadisticas_proyecto WHERE proyecto_id = $1', [movimiento.proyecto_id]);
+    if (fichaActual.rows.length > 0 && fichaActual.rows[0].proyecto_eliminado) {
+      return res.status(403).json({ error: 'Este proyecto fue eliminado — su ficha de Estadísticas es de solo lectura' });
+    }
+
     await client.query('BEGIN');
     await client.query(
       `UPDATE estadisticas_proyecto SET ${columna} = GREATEST(${columna} - $1, 0), updated_at = CURRENT_TIMESTAMP WHERE proyecto_id = $2`,
@@ -344,6 +414,12 @@ router.post('/:proyecto_id/abono', async (req, res) => {
       return res.status(400).json({ error: 'valor y fecha son obligatorios' });
     }
 
+    // Solo lectura si el proyecto ya fue eliminado (ver comentario en POST /:proyecto_id/movimiento).
+    const fichaActual = await pool.query('SELECT proyecto_eliminado FROM estadisticas_proyecto WHERE proyecto_id = $1', [proyecto_id]);
+    if (fichaActual.rows.length > 0 && fichaActual.rows[0].proyecto_eliminado) {
+      return res.status(403).json({ error: 'Este proyecto fue eliminado — su ficha de Estadísticas es de solo lectura' });
+    }
+
     const result = await pool.query(
       'INSERT INTO abonos_proyecto (proyecto_id, valor, fecha) VALUES ($1, $2, $3) RETURNING *',
       [proyecto_id, valor, fecha]
@@ -367,6 +443,16 @@ router.put('/abono/:id', async (req, res) => {
       return res.status(400).json({ error: 'valor y fecha son obligatorios' });
     }
 
+    const abonoActual = await pool.query('SELECT proyecto_id FROM abonos_proyecto WHERE id = $1', [id]);
+    if (abonoActual.rows.length === 0) {
+      return res.status(404).json({ error: 'Abono no encontrado' });
+    }
+    // Solo lectura si el proyecto ya fue eliminado (ver comentario en POST /:proyecto_id/movimiento).
+    const fichaActual = await pool.query('SELECT proyecto_eliminado FROM estadisticas_proyecto WHERE proyecto_id = $1', [abonoActual.rows[0].proyecto_id]);
+    if (fichaActual.rows.length > 0 && fichaActual.rows[0].proyecto_eliminado) {
+      return res.status(403).json({ error: 'Este proyecto fue eliminado — su ficha de Estadísticas es de solo lectura' });
+    }
+
     const result = await pool.query(
       'UPDATE abonos_proyecto SET valor = $1, fecha = $2 WHERE id = $3 RETURNING *',
       [valor, fecha, id]
@@ -388,6 +474,17 @@ router.put('/abono/:id', async (req, res) => {
 router.delete('/abono/:id', async (req, res) => {
   try {
     const { id } = req.params;
+
+    const abonoActual = await pool.query('SELECT proyecto_id FROM abonos_proyecto WHERE id = $1', [id]);
+    if (abonoActual.rows.length === 0) {
+      return res.status(404).json({ error: 'Abono no encontrado' });
+    }
+    // Solo lectura si el proyecto ya fue eliminado (ver comentario en POST /:proyecto_id/movimiento).
+    const fichaActual = await pool.query('SELECT proyecto_eliminado FROM estadisticas_proyecto WHERE proyecto_id = $1', [abonoActual.rows[0].proyecto_id]);
+    if (fichaActual.rows.length > 0 && fichaActual.rows[0].proyecto_eliminado) {
+      return res.status(403).json({ error: 'Este proyecto fue eliminado — su ficha de Estadísticas es de solo lectura' });
+    }
+
     const result = await pool.query('DELETE FROM abonos_proyecto WHERE id = $1 RETURNING *', [id]);
 
     if (result.rows.length === 0) {
@@ -398,6 +495,46 @@ router.delete('/abono/:id', async (req, res) => {
   } catch (error) {
     console.error('Error eliminando abono:', error);
     res.status(500).json({ error: 'Error al eliminar el abono' });
+  }
+});
+
+// 🗑️ ELIMINAR la ficha COMPLETA de Estadísticas de un proyecto (2026-08-28, a pedido explícito
+// del usuario): borra estadisticas_proyecto, abonos_proyecto y movimientos_costos de ese
+// proyecto_id para siempre. A diferencia de eliminar el proyecto (que NUNCA borra esta ficha —
+// ver borrarDependenciasDeProyecto en cascadaProyecto.js), esta es la ÚNICA forma de que un
+// registro financiero desaparezca de verdad, y está reservada exclusivamente a GERENCIA — ni
+// siquiera Área Administrativa (que sí puede eliminar proyectos) tiene esta facultad.
+router.delete('/:proyecto_id', async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const { proyecto_id } = req.params;
+    const { usuario_id, empresa_id } = req.body;
+
+    if (!usuario_id || !empresa_id) {
+      return res.status(400).json({ error: 'usuario_id y empresa_id son obligatorios' });
+    }
+    const esGerente = await esGerencia(usuario_id, empresa_id);
+    if (!esGerente) {
+      return res.status(403).json({ error: 'Solo Gerencia puede eliminar una ficha de Estadísticas' });
+    }
+
+    await client.query('BEGIN');
+    await client.query('DELETE FROM movimientos_costos WHERE proyecto_id = $1', [proyecto_id]);
+    await client.query('DELETE FROM abonos_proyecto WHERE proyecto_id = $1', [proyecto_id]);
+    const result = await client.query('DELETE FROM estadisticas_proyecto WHERE proyecto_id = $1 RETURNING *', [proyecto_id]);
+    await client.query('COMMIT');
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'No hay estadísticas para este proyecto' });
+    }
+
+    res.json({ mensaje: 'Ficha de estadísticas eliminada exitosamente' });
+  } catch (error) {
+    await client.query('ROLLBACK');
+    console.error('Error eliminando ficha de estadísticas:', error);
+    res.status(500).json({ error: 'Error al eliminar la ficha de estadísticas' });
+  } finally {
+    client.release();
   }
 });
 
