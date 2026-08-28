@@ -427,7 +427,11 @@ router.post('/contratos/:id/crear-proyecto', async (req, res) => {
   } catch (error) {
     await client.query('ROLLBACK');
     console.error('Error creando proyecto desde contrato:', error.message);
-    res.status(500).json({ error: 'No se pudo crear el proyecto. Intenta de nuevo.' });
+    // TEMPORAL (2026-08-27): se incluye error.message en la respuesta solo para diagnosticar
+    // el bug reportado ("no se pudo crear el proyecto"). No cambia ninguna lógica, solo hace
+    // visible la causa real de Postgres en el Alert del frontend. Se debe revertir a un mensaje
+    // genérico una vez identificado y solucionado el problema real.
+    res.status(500).json({ error: `No se pudo crear el proyecto. Detalle: ${error.message}` });
   } finally {
     client.release();
   }
