@@ -356,7 +356,12 @@ router.post('/contratos/:id/crear-proyecto', async (req, res) => {
   const client = await pool.connect();
   try {
     const { id } = req.params;
-    const { creado_por_usuario_id } = req.body;
+    // FIX (2026-08-27, bug reportado: "Cannot destructure property 'creado_por_usuario_id' of
+    // 'req.body' as it is undefined"): el frontend llama este endpoint sin mandar body
+    // (api.post sin segundo argumento), así que req.body llega undefined en vez de {}. El
+    // "|| {}" evita el crash y deja creado_por_usuario_id como undefined, que ya estaba
+    // contemplado más abajo (configurarProyectoNuevo lo trata igual que null).
+    const { creado_por_usuario_id } = req.body || {};
 
     const contratoResult = await client.query('SELECT * FROM contratos WHERE id = $1', [id]);
     if (contratoResult.rows.length === 0) {
@@ -427,11 +432,7 @@ router.post('/contratos/:id/crear-proyecto', async (req, res) => {
   } catch (error) {
     await client.query('ROLLBACK');
     console.error('Error creando proyecto desde contrato:', error.message);
-    // TEMPORAL (2026-08-27): se incluye error.message en la respuesta solo para diagnosticar
-    // el bug reportado ("no se pudo crear el proyecto"). No cambia ninguna lógica, solo hace
-    // visible la causa real de Postgres en el Alert del frontend. Se debe revertir a un mensaje
-    // genérico una vez identificado y solucionado el problema real.
-    res.status(500).json({ error: `No se pudo crear el proyecto. Detalle: ${error.message}` });
+    res.status(500).json({ error: 'No se pudo crear el proyecto. Intenta de nuevo.' });
   } finally {
     client.release();
   }
