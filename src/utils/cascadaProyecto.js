@@ -61,6 +61,17 @@ async function borrarDependenciasDeProyecto(client, proyectoId) {
   // borrarse, para que siga viéndose en la pantalla de Cotizaciones si corresponde.
   await client.query('UPDATE cotizaciones SET proyecto_id = NULL WHERE proyecto_id = $1', [proyectoId]);
 
+  // BUG (2026-08-28, reportado por el usuario): "proyectos creados desde contrato no se pueden
+  // eliminar" — causa real encontrada con el detalle real del error de Postgres: clientes.proyecto_id
+  // tiene una foreign key ("clientes_proyecto_id_fkey", agregada a mano en producción, no está en
+  // los archivos de migración versionados) SIN ON DELETE SET NULL. Los proyectos creados desde un
+  // contrato quedan enlazados en clientes.proyecto_id (ver cotizaciones_v2.js, al crear el
+  // proyecto); los creados manualmente desde "Nuevo Proyecto" nunca tocan esa columna, por eso
+  // solo fallaba el primer caso. Se desvincula aquí, igual que ya se hacía con cotizaciones y
+  // contratos, para que el cliente sobreviva intacto y solo pierda la referencia al proyecto ya
+  // borrado.
+  await client.query('UPDATE clientes SET proyecto_id = NULL WHERE proyecto_id = $1', [proyectoId]);
+
   return urlsABorrar;
 }
 
