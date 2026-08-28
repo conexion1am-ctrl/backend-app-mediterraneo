@@ -2,7 +2,7 @@ const express = require('express');
 const { Pool } = require('pg');
 const router = express.Router();
 require('dotenv').config();
-const { generarExcelFinancieroBuffer } = require('../utils/generarExcelFinanciero');
+const { generarExcelFinancieroBuffer, generarExcelBalanceGeneralBuffer } = require('../utils/generarExcelFinanciero');
 const { subirBufferAStorage, borrarArchivoDeStorage } = require('../utils/firebaseAdmin');
 const { esGerencia } = require('../utils/permisos');
 
@@ -39,35 +39,48 @@ async function obtenerEstadisticasProyecto(identificador) {
   // para encontrar la fila correcta más arriba.
   const proyecto_id = stats.proyecto_id;
 
-  const abonosResult = await pool.query(
-    'SELECT * FROM abonos_proyecto WHERE proyecto_id = $1 ORDER BY fecha DESC',
-    [proyecto_id]
-  );
+  // Si la ficha es huérfana (proyecto ya eliminado), proyecto_id es NULL — abonos_proyecto y
+  // movimientos_costos ya perdieron su vínculo (mismo ON DELETE SET NULL, ver migraciones.js) y
+  // "WHERE proyecto_id = NULL" nunca compara verdadero en SQL, así que no tiene sentido ni siquiera
+  // consultarlas: siempre devolverían vacío. En vez de eso, se usa el total ya congelado en
+  // total_abonado_snapshot (capturado en cascadaProyecto.js justo antes de que el proyecto se
+  // borrara, ver comentario ahí) y se muestra el historial de movimientos como vacío (no hay forma
+  // de recuperar el detalle línea por línea una vez perdido el vínculo — ver bug documentado en
+  // migraciones.js, columna total_abonado_snapshot).
+  const abonosResult = proyecto_id != null
+    ? await pool.query('SELECT * FROM abonos_proyecto WHERE proyecto_id = $1 ORDER BY fecha DESC', [proyecto_id])
+    : { rows: [] };
 
-  const movimientosResult = await pool.query(
-    `SELECT m.*, c.nombre AS categoria_nombre
-     FROM movimientos_costos m
-     LEFT JOIN categorias_costo c ON c.id = m.categoria_id
-     WHERE m.proyecto_id = $1
-     ORDER BY m.fecha DESC, m.created_at DESC`,
-    [proyecto_id]
-  );
+  const movimientosResult = proyecto_id != null
+    ? await pool.query(
+        `SELECT m.*, c.nombre AS categoria_nombre
+         FROM movimientos_costos m
+         LEFT JOIN categorias_costo c ON c.id = m.categoria_id
+         WHERE m.proyecto_id = $1
+         ORDER BY m.fecha DESC, m.created_at DESC`,
+        [proyecto_id]
+      )
+    : { rows: [] };
 
-  const resumenPorCategoriaResult = await pool.query(
-    `SELECT c.id AS categoria_id, c.nombre AS categoria_nombre,
-            COALESCE(SUM(m.valor) FILTER (WHERE m.tipo = 'materiales'), 0) AS total_materiales,
-            COALESCE(SUM(m.valor) FILTER (WHERE m.tipo = 'mano_obra'), 0) AS total_mano_obra,
-            COALESCE(SUM(m.valor) FILTER (WHERE m.tipo = 'imprevistos'), 0) AS total_imprevistos,
-            COALESCE(SUM(m.valor), 0) AS total
-     FROM movimientos_costos m
-     JOIN categorias_costo c ON c.id = m.categoria_id
-     WHERE m.proyecto_id = $1
-     GROUP BY c.id, c.nombre
-     ORDER BY total DESC`,
-    [proyecto_id]
-  );
+  const resumenPorCategoriaResult = proyecto_id != null
+    ? await pool.query(
+        `SELECT c.id AS categoria_id, c.nombre AS categoria_nombre,
+                COALESCE(SUM(m.valor) FILTER (WHERE m.tipo = 'materiales'), 0) AS total_materiales,
+                COALESCE(SUM(m.valor) FILTER (WHERE m.tipo = 'mano_obra'), 0) AS total_mano_obra,
+                COALESCE(SUM(m.valor) FILTER (WHERE m.tipo = 'imprevistos'), 0) AS total_imprevistos,
+                COALESCE(SUM(m.valor), 0) AS total
+         FROM movimientos_costos m
+         JOIN categorias_costo c ON c.id = m.categoria_id
+         WHERE m.proyecto_id = $1
+         GROUP BY c.id, c.nombre
+         ORDER BY total DESC`,
+        [proyecto_id]
+      )
+    : { rows: [] };
 
-  const totalAbonado = abonosResult.rows.reduce((sum, a) => sum + parseFloat(a.valor), 0);
+  const totalAbonado = proyecto_id != null
+    ? abonosResult.rows.reduce((sum, a) => sum + parseFloat(a.valor), 0)
+    : parseFloat(stats.total_abonado_snapshot || 0);
   const costos = parseFloat(stats.costos_materiales) + parseFloat(stats.valor_mano_obra) + parseFloat(stats.valor_imprevistos);
   const utilidad = parseFloat(stats.valor_contrato) - costos;
 
@@ -118,6 +131,199 @@ router.get('/proyectos-lista/:empresa_id', async (req, res) => {
   } catch (error) {
     console.error('Error listando proyectos para Estadísticas:', error);
     res.status(500).json({ error: 'Error al listar proyectos' });
+  }
+});
+
+// 📊 BALANCE FINANCIERO GENERAL de la empresa (2026-08-28, a pedido explícito del usuario): suma
+// las estadísticas de TODOS los proyectos de la empresa — activos Y huérfanos (proyectos ya
+// eliminados, cuya ficha se conserva siempre, ver el blindaje 2026-08-28 en cascadaProyecto.js) —
+// en un solo balance: valor total contratado, total abonado, costos totales, utilidad total.
+// También arma el desglose por proyecto y por categoría de costo (transversal a todos los
+// proyectos), reutilizando exactamente los mismos números que ya muestra cada ficha individual —
+// no se inventa ni recalcula nada nuevo, solo se suma. Reservado a GERENCIA, igual que el borrado
+// de una ficha de Estadísticas: es información financiera de toda la compañía, no de un proyecto
+// puntual. Se define ANTES de GET /:proyecto_id para que Express no confunda "balance-general" con
+// un proyecto_id (mismo motivo que proyectos-lista, arriba).
+async function calcularBalanceGeneral(empresa_id) {
+  // Trae la fila de estadisticas_proyecto de CADA proyecto de la empresa (activos vía JOIN a
+  // proyectos, huérfanos por su propio empresa_id) junto con el nombre correcto en cada caso.
+  const fichasResult = await pool.query(
+    `SELECT
+       ep.id AS ficha_id,
+       ep.proyecto_id,
+       ep.proyecto_eliminado,
+       ep.total_abonado_snapshot,
+       COALESCE(p.nombre, ep.proyecto_nombre_snapshot, 'Proyecto eliminado') AS proyecto_nombre,
+       COALESCE(p.cliente_nombre_snapshot, ep.cliente_nombre_snapshot) AS cliente_nombre,
+       ep.valor_contrato,
+       ep.costos_materiales,
+       ep.valor_mano_obra,
+       ep.valor_imprevistos
+     FROM estadisticas_proyecto ep
+     LEFT JOIN proyectos p ON p.id = ep.proyecto_id
+     WHERE ep.empresa_id = $1
+     ORDER BY COALESCE(p.created_at, ep.updated_at) DESC`,
+    [empresa_id]
+  );
+
+  // Abonos y resumen por categoría se agregan aparte (uno por ficha sería una consulta por
+  // proyecto — en cambio, se traen TODOS los abonos/movimientos de la empresa de una vez y se
+  // agrupan en memoria, mucho más liviano para una empresa con muchos proyectos).
+  //
+  // BUG encontrado en auditoría (2026-08-28) y corregido acá: este query original filtraba
+  // "WHERE proyecto_id = ANY($1::int[])" con los proyecto_id de las fichas ACTIVAS únicamente
+  // (proyectoIds ya excluía los NULL de las huérfanas) — los abonos de proyectos YA ELIMINADOS
+  // nunca se sumaban al balance, porque abonos_proyecto.proyecto_id también quedó en NULL para
+  // ellos (mismo ON DELETE SET NULL que a estadisticas_proyecto), y no existe ninguna otra columna
+  // en abonos_proyecto que permita re-vincularlos a su ficha huérfana. Para los proyectos activos
+  // se sigue sumando en vivo (más preciso, refleja abonos recién registrados); para los huérfanos
+  // se usa total_abonado_snapshot, el total que quedó congelado en el momento del blindaje (ver
+  // cascadaProyecto.js) ANTES de que el proyecto se borrara y se perdiera el vínculo.
+  const proyectoIds = fichasResult.rows.map((f) => f.proyecto_id).filter((id) => id != null);
+
+  const abonosPorProyecto = {};
+  if (proyectoIds.length > 0) {
+    const abonosResult = await pool.query(
+      'SELECT proyecto_id, COALESCE(SUM(valor), 0) AS total FROM abonos_proyecto WHERE proyecto_id = ANY($1::int[]) GROUP BY proyecto_id',
+      [proyectoIds]
+    );
+    abonosResult.rows.forEach((a) => { abonosPorProyecto[a.proyecto_id] = parseFloat(a.total); });
+  }
+
+  // Mismo bug aplicaba acá: el JOIN a estadisticas_proyecto por proyecto_id excluye los
+  // movimientos_costos de proyectos eliminados (proyecto_id también quedó en NULL). A diferencia
+  // de los abonos, el desglose POR CATEGORÍA de un proyecto eliminado no se puede reconstruir de
+  // forma agregada sin perder el sentido (no hay snapshot de "costos por categoría" congelado,
+  // solo el total por tipo en estadisticas_proyecto) — se documenta como limitación conocida más
+  // abajo, en total_costos, que sí sigue siendo exacto porque usa las columnas de estadisticas_proyecto.
+  const categoriasResult = await pool.query(
+    `SELECT c.id AS categoria_id, c.nombre AS categoria_nombre,
+            COALESCE(SUM(m.valor) FILTER (WHERE m.tipo = 'materiales'), 0) AS total_materiales,
+            COALESCE(SUM(m.valor) FILTER (WHERE m.tipo = 'mano_obra'), 0) AS total_mano_obra,
+            COALESCE(SUM(m.valor) FILTER (WHERE m.tipo = 'imprevistos'), 0) AS total_imprevistos,
+            COALESCE(SUM(m.valor), 0) AS total
+     FROM movimientos_costos m
+     JOIN categorias_costo c ON c.id = m.categoria_id
+     JOIN estadisticas_proyecto ep ON ep.proyecto_id = m.proyecto_id
+     WHERE ep.empresa_id = $1
+     GROUP BY c.id, c.nombre
+     ORDER BY total DESC`,
+    [empresa_id]
+  );
+
+  let totalContratado = 0;
+  let totalAbonado = 0;
+  let totalCostos = 0;
+
+  const porProyecto = fichasResult.rows.map((f) => {
+    const valorContrato = parseFloat(f.valor_contrato || 0);
+    const costos = parseFloat(f.costos_materiales || 0) + parseFloat(f.valor_mano_obra || 0) + parseFloat(f.valor_imprevistos || 0);
+    // Activo: se suma en vivo desde abonos_proyecto (más preciso). Huérfano: se usa el snapshot
+    // congelado en el momento del blindaje, ya que abonos_proyecto.proyecto_id es NULL y no hay
+    // forma de recuperar el valor real por otra vía (ver comentario largo más arriba).
+    const abonado = f.proyecto_id != null
+      ? (abonosPorProyecto[f.proyecto_id] || 0)
+      : parseFloat(f.total_abonado_snapshot || 0);
+    const utilidad = valorContrato - costos;
+
+    totalContratado += valorContrato;
+    totalAbonado += abonado;
+    totalCostos += costos;
+
+    return {
+      ficha_id: f.ficha_id,
+      proyecto_id: f.proyecto_id,
+      proyecto_nombre: f.proyecto_nombre,
+      cliente_nombre: f.cliente_nombre,
+      proyecto_eliminado: f.proyecto_eliminado,
+      valor_contrato: valorContrato,
+      total_abonado: abonado,
+      saldo_pendiente: valorContrato - abonado,
+      costos_materiales: parseFloat(f.costos_materiales || 0),
+      valor_mano_obra: parseFloat(f.valor_mano_obra || 0),
+      valor_imprevistos: parseFloat(f.valor_imprevistos || 0),
+      costos_totales: costos,
+      utilidad,
+    };
+  });
+
+  return {
+    total_proyectos: porProyecto.length,
+    total_contratado: totalContratado,
+    total_abonado: totalAbonado,
+    total_saldo_pendiente: totalContratado - totalAbonado,
+    total_costos: totalCostos,
+    utilidad_total: totalContratado - totalCostos,
+    por_proyecto: porProyecto,
+    por_categoria: categoriasResult.rows.map((c) => ({
+      categoria_id: c.categoria_id,
+      categoria_nombre: c.categoria_nombre,
+      total_materiales: parseFloat(c.total_materiales || 0),
+      total_mano_obra: parseFloat(c.total_mano_obra || 0),
+      total_imprevistos: parseFloat(c.total_imprevistos || 0),
+      total: parseFloat(c.total || 0),
+    })),
+  };
+}
+
+router.get('/balance-general/:empresa_id', async (req, res) => {
+  try {
+    const { empresa_id } = req.params;
+    const { usuario_id } = req.query;
+
+    if (!usuario_id) {
+      return res.status(400).json({ error: 'usuario_id es obligatorio' });
+    }
+    const esGerente = await esGerencia(usuario_id, empresa_id);
+    if (!esGerente) {
+      return res.status(403).json({ error: 'Solo Gerencia puede ver el balance financiero general' });
+    }
+
+    const balance = await calcularBalanceGeneral(empresa_id);
+    res.json(balance);
+  } catch (error) {
+    console.error('Error calculando balance general:', error);
+    res.status(500).json({ error: 'No se pudo calcular el balance general' });
+  }
+});
+
+// 📊 GENERAR Y DESCARGAR el balance financiero general en Excel — mismo patrón que
+// GET /:proyecto_id/excel (genera al vuelo, sube a Storage, se autodestruye a los 10 minutos),
+// pero con el balance de TODOS los proyectos en vez de uno solo. Reservado a Gerencia.
+router.get('/balance-general/:empresa_id/excel', async (req, res) => {
+  try {
+    const { empresa_id } = req.params;
+    const { usuario_id } = req.query;
+
+    if (!usuario_id) {
+      return res.status(400).json({ error: 'usuario_id es obligatorio' });
+    }
+    const esGerente = await esGerencia(usuario_id, empresa_id);
+    if (!esGerente) {
+      return res.status(403).json({ error: 'Solo Gerencia puede descargar el balance financiero general' });
+    }
+
+    const empresaResult = await pool.query('SELECT nombre FROM empresas WHERE id = $1', [empresa_id]);
+    const empresaNombre = empresaResult.rows[0]?.nombre || '';
+
+    const balance = await calcularBalanceGeneral(empresa_id);
+    const buffer = await generarExcelBalanceGeneralBuffer({ empresaNombre, balance });
+
+    const rutaDestino = `estados_financieros/balance_general_${empresa_id}_${Date.now()}.xlsx`;
+    const url = await subirBufferAStorage(
+      buffer,
+      rutaDestino,
+      'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+    );
+
+    setTimeout(() => {
+      borrarArchivoDeStorage(url).catch(() => {});
+    }, 10 * 60 * 1000);
+
+    res.json({ mensaje: 'Balance general generado exitosamente', url });
+  } catch (error) {
+    console.error('Error generando Excel de balance general:', error.message, error.stack);
+    res.status(500).json({ error: 'No se pudo generar el balance general. Intenta de nuevo en unos minutos.' });
   }
 });
 

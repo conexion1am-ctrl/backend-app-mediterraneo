@@ -46,11 +46,25 @@ async function borrarDependenciasDeProyecto(client, proyectoId) {
   );
   if (proyectoInfo.rows.length > 0) {
     const { nombre, cliente_nombre_snapshot } = proyectoInfo.rows[0];
+    // total_abonado_snapshot (bug encontrado en auditoría del Balance Financiero General,
+    // 2026-08-28): abonos_proyecto.proyecto_id es la ÚNICA columna que la vincula a esta ficha, y
+    // esa misma columna está a punto de quedar en NULL más abajo (DELETE FROM proyectos dispara el
+    // ON DELETE SET NULL) — sin capturar el total ACÁ, mientras proyecto_id todavía es válido, el
+    // dinero abonado por el cliente de un proyecto eliminado desaparecería matemáticamente de
+    // cualquier balance futuro (ver estadisticas.js: calcularBalanceGeneral y
+    // obtenerEstadisticasProyecto ya usan este snapshot para fichas huérfanas). Se suma ANTES del
+    // UPDATE que marca la ficha como huérfana, en la misma transacción.
+    const totalAbonadoResult = await client.query(
+      'SELECT COALESCE(SUM(valor), 0) AS total FROM abonos_proyecto WHERE proyecto_id = $1',
+      [proyectoId]
+    );
+    const totalAbonado = totalAbonadoResult.rows[0].total;
     await client.query(
       `UPDATE estadisticas_proyecto
-       SET proyecto_eliminado = true, proyecto_nombre_snapshot = $1, cliente_nombre_snapshot = $2, updated_at = CURRENT_TIMESTAMP
-       WHERE proyecto_id = $3`,
-      [nombre, cliente_nombre_snapshot || null, proyectoId]
+       SET proyecto_eliminado = true, proyecto_nombre_snapshot = $1, cliente_nombre_snapshot = $2,
+           total_abonado_snapshot = $3, updated_at = CURRENT_TIMESTAMP
+       WHERE proyecto_id = $4`,
+      [nombre, cliente_nombre_snapshot || null, totalAbonado, proyectoId]
     );
   }
   // Las actividades/checklist por área (proyecto_actividades) sí se limpian: son de gestión de

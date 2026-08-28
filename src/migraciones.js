@@ -446,6 +446,24 @@ async function aplicarMigraciones() {
       END $$;
     `);
 
+    // total_abonado_snapshot en estadisticas_proyecto (2026-08-28, corrección de bug encontrado en
+    // auditoría del Balance Financiero General): abonos_proyecto y movimientos_costos SOLO tienen
+    // proyecto_id como vínculo (no existe ninguna columna que apunte al id propio de
+    // estadisticas_proyecto) y esa columna queda en NULL por el mismo ON DELETE SET NULL de arriba
+    // en cuanto se borra el proyecto — a diferencia de estadisticas_proyecto, que sí guarda
+    // snapshots de nombre para sobrevivir. Sin este snapshot, en cuanto un proyecto se elimina sus
+    // abonos quedan matemáticamente huérfanos e imposibles de recuperar (proyecto_id = NULL para
+    // TODOS, sin forma de saber a qué ficha pertenecía cada uno), y tanto la ficha individual
+    // (obtenerEstadisticasProyecto) como el Balance General terminan mostrando "Total abonado" en
+    // $0 para cualquier proyecto ya eliminado que tuviera abonos. Se guarda como snapshot AGREGADO
+    // (un solo total, no el historial línea por línea) porque para cuando se detecta este bug los
+    // abonos de proyectos ya eliminados en producción ya perdieron su vínculo — no hay forma de
+    // reconstruir el historial con fecha exacta, solo el total, que es lo mínimo indispensable
+    // para que el balance general no mienta. Se llena en el momento del blindaje (ver
+    // cascadaProyecto.js), justo ANTES de que el proyecto se borre y dispare el SET NULL — a partir
+    // de ahora, todo proyecto que se elimine queda con su total de abonos correctamente congelado.
+    await pool.query(`ALTER TABLE estadisticas_proyecto ADD COLUMN IF NOT EXISTS total_abonado_snapshot DECIMAL(12, 2)`);
+
     console.log('✅ Esquema verificado/actualizado correctamente');
   } catch (error) {
     // No tumbamos el servidor si esto falla: preferimos que la app siga funcionando con el
