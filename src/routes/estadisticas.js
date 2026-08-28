@@ -11,12 +11,33 @@ const pool = new Pool({
   ssl: { rejectUnauthorized: false }
 });
 
+// Busca la fila de estadisticas_proyecto a partir del identificador que mande el frontend, que
+// puede ser CUALQUIERA de los dos según el caso (ver comentario largo en GET /proyectos-lista):
+// - Si el proyecto sigue activo: ese identificador ES su proyecto_id real (funciona igual que
+//   siempre, antes de que existieran las fichas huérfanas).
+// - Si el proyecto ya fue eliminado: proyecto_id de la ficha quedó en NULL (ON DELETE SET NULL,
+//   ver migraciones.js) y el identificador estable pasa a ser ep.id (la clave primaria propia de
+//   estadisticas_proyecto, que nunca cambia). Se prueba primero por proyecto_id y, si no aparece
+//   nada, se reintenta por id propio — así funciona para ambos casos sin que el frontend tenga
+//   que saber de antemano cuál de los dos está mandando.
+async function buscarFilaEstadisticas(client, identificador) {
+  let result = await client.query('SELECT * FROM estadisticas_proyecto WHERE proyecto_id = $1', [identificador]);
+  if (result.rows.length === 0) {
+    result = await client.query('SELECT * FROM estadisticas_proyecto WHERE id = $1 AND proyecto_eliminado = true', [identificador]);
+  }
+  return result.rows[0] || null;
+}
+
 // Arma el mismo objeto de estadísticas que devuelve GET /:proyecto_id, pero como función
 // reutilizable (la usa también el endpoint de Excel, para no duplicar las 4 consultas).
-async function obtenerEstadisticasProyecto(proyecto_id) {
-  const statsResult = await pool.query('SELECT * FROM estadisticas_proyecto WHERE proyecto_id = $1', [proyecto_id]);
-  if (statsResult.rows.length === 0) return null;
-  const stats = statsResult.rows[0];
+async function obtenerEstadisticasProyecto(identificador) {
+  const stats = await buscarFilaEstadisticas(pool, identificador);
+  if (!stats) return null;
+
+  // A partir de acá usamos SIEMPRE stats.proyecto_id (puede ser NULL si es huérfana) y stats.id
+  // (el identificador propio) — nunca el parámetro `identificador` de entrada, que solo sirvió
+  // para encontrar la fila correcta más arriba.
+  const proyecto_id = stats.proyecto_id;
 
   const abonosResult = await pool.query(
     'SELECT * FROM abonos_proyecto WHERE proyecto_id = $1 ORDER BY fecha DESC',
@@ -52,6 +73,11 @@ async function obtenerEstadisticasProyecto(proyecto_id) {
 
   return {
     ...stats,
+    // id_ficha: identificador estable a usar en el frontend para CUALQUIER acción posterior sobre
+    // esta ficha (ej. el botón "Eliminar estadísticas" de Gerencia) — es proyecto_id si el
+    // proyecto sigue activo, o el id propio de la ficha si ya es huérfana. Evita que el frontend
+    // tenga que replicar esta misma lógica de "cuál de los dos usar".
+    id_ficha: proyecto_id || stats.id,
     abonos: abonosResult.rows,
     movimientos_costos: movimientosResult.rows,
     resumen_por_categoria: resumenPorCategoriaResult.rows,
@@ -71,12 +97,18 @@ router.get('/proyectos-lista/:empresa_id', async (req, res) => {
     const { empresa_id } = req.params;
 
     const activosResult = await pool.query(
-      "SELECT id, nombre, cliente_nombre_snapshot, false AS proyecto_eliminado FROM proyectos WHERE empresa_id = $1 AND estado = 'activo' ORDER BY created_at DESC",
+      "SELECT id, id AS proyecto_id, nombre, cliente_nombre_snapshot, false AS proyecto_eliminado FROM proyectos WHERE empresa_id = $1 AND estado = 'activo' ORDER BY created_at DESC",
       [empresa_id]
     );
+    // OJO: proyecto_id aquí YA ES NULL para las fichas huérfanas (ver ON DELETE SET NULL en
+    // migraciones.js — al borrarse el proyecto, esta columna se desvincula automáticamente para
+    // que la fila sobreviva). Por eso NO se puede usar proyecto_id para identificar la ficha una
+    // vez que el proyecto ya no existe: se usa el id propio de estadisticas_proyecto (ep.id, que
+    // nunca cambia) como identificador estable, tanto para pedir el detalle (GET /:id ya acepta
+    // proyecto_id real para los activos) como para poder borrarla después.
     const huerfanosResult = await pool.query(
-      `SELECT proyecto_id AS id, proyecto_nombre_snapshot AS nombre, cliente_nombre_snapshot, true AS proyecto_eliminado
-       FROM estadisticas_proyecto
+      `SELECT ep.id AS id, NULL AS proyecto_id, proyecto_nombre_snapshot AS nombre, cliente_nombre_snapshot, true AS proyecto_eliminado
+       FROM estadisticas_proyecto ep
        WHERE empresa_id = $1 AND proyecto_eliminado = true
        ORDER BY updated_at DESC`,
       [empresa_id]
@@ -507,7 +539,7 @@ router.delete('/abono/:id', async (req, res) => {
 router.delete('/:proyecto_id', async (req, res) => {
   const client = await pool.connect();
   try {
-    const { proyecto_id } = req.params;
+    const { proyecto_id: identificador } = req.params;
     const { usuario_id, empresa_id } = req.body;
 
     if (!usuario_id || !empresa_id) {
@@ -518,15 +550,23 @@ router.delete('/:proyecto_id', async (req, res) => {
       return res.status(403).json({ error: 'Solo Gerencia puede eliminar una ficha de Estadísticas' });
     }
 
-    await client.query('BEGIN');
-    await client.query('DELETE FROM movimientos_costos WHERE proyecto_id = $1', [proyecto_id]);
-    await client.query('DELETE FROM abonos_proyecto WHERE proyecto_id = $1', [proyecto_id]);
-    const result = await client.query('DELETE FROM estadisticas_proyecto WHERE proyecto_id = $1 RETURNING *', [proyecto_id]);
-    await client.query('COMMIT');
-
-    if (result.rows.length === 0) {
+    // El identificador que manda el frontend puede ser el proyecto_id real (proyecto activo) o el
+    // id propio de la ficha (proyecto ya eliminado, ver comentario largo en buscarFilaEstadisticas
+    // más arriba) — se busca la fila real primero para saber con certeza su clave primaria (ficha.id)
+    // y su proyecto_id verdadero (puede ser NULL), y se borra usando esos dos valores directamente
+    // en vez de volver a adivinar cuál de los dos era el identificador de entrada.
+    const ficha = await buscarFilaEstadisticas(client, identificador);
+    if (!ficha) {
       return res.status(404).json({ error: 'No hay estadísticas para este proyecto' });
     }
+
+    await client.query('BEGIN');
+    await client.query('DELETE FROM movimientos_costos WHERE proyecto_id = $1', [ficha.proyecto_id]);
+    await client.query('DELETE FROM abonos_proyecto WHERE proyecto_id = $1', [ficha.proyecto_id]);
+    // Por id propio, no por proyecto_id: si la ficha es huérfana, proyecto_id ya es NULL y
+    // "WHERE proyecto_id = NULL" nunca compara verdadero en SQL (no borraría nada).
+    await client.query('DELETE FROM estadisticas_proyecto WHERE id = $1', [ficha.id]);
+    await client.query('COMMIT');
 
     res.json({ mensaje: 'Ficha de estadísticas eliminada exitosamente' });
   } catch (error) {
