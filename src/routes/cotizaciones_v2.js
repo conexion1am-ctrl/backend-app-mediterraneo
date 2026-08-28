@@ -217,6 +217,48 @@ router.post('/plantillas/crear', async (req, res) => {
   }
 });
 
+// ✏️ ACTUALIZAR plantilla existente (2026-08-28, a pedido del usuario): permite agregar/quitar
+// ítems, cambiar valores y textos, y guardar los cambios sobre la MISMA plantilla, en vez de
+// tener que borrarla y crear una nueva cada vez que cambian las condiciones de un cliente
+// frecuente. Reemplaza todos los campos enviados (no hace merge parcial) — el frontend siempre
+// manda el objeto completo de la plantilla, igual que al crearla.
+router.put('/plantillas/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { nombre, saludo, parrafo_contexto, condiciones_pago, tiempo_entrega, items, descuento } = req.body;
+
+    if (!nombre || !items || items.length === 0) {
+      return res.status(400).json({ error: 'nombre e items son obligatorios' });
+    }
+
+    const result = await pool.query(
+      `UPDATE plantillas_cotizacion
+       SET nombre = $1, saludo = $2, parrafo_contexto = $3, condiciones_pago = $4,
+           tiempo_entrega = $5, items = $6, descuento = $7
+       WHERE id = $8 RETURNING *`,
+      [
+        nombre,
+        saludo || SALUDO_DEFECTO,
+        parrafo_contexto || PARRAFO_CONTEXTO_DEFECTO,
+        JSON.stringify(condiciones_pago && condiciones_pago.length ? condiciones_pago : CONDICIONES_PAGO_DEFECTO),
+        tiempo_entrega || TIEMPO_ENTREGA_DEFECTO,
+        JSON.stringify(items),
+        parseFloat(descuento) || 0,
+        id,
+      ]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Plantilla no encontrada' });
+    }
+
+    res.json({ mensaje: 'Plantilla actualizada exitosamente', plantilla: result.rows[0] });
+  } catch (error) {
+    console.error('Error actualizando plantilla:', error);
+    res.status(500).json({ error: 'Error al actualizar plantilla' });
+  }
+});
+
 // 🗑️ ELIMINAR plantilla
 router.delete('/plantillas/:id', async (req, res) => {
   try {
