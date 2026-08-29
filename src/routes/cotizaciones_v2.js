@@ -222,20 +222,28 @@ router.post('/plantillas/crear', async (req, res) => {
 // tener que borrarla y crear una nueva cada vez que cambian las condiciones de un cliente
 // frecuente. Reemplaza todos los campos enviados (no hace merge parcial) — el frontend siempre
 // manda el objeto completo de la plantilla, igual que al crearla.
+// SEGURIDAD (2026-08-28, corregido a raíz de una pregunta del usuario sobre confidencialidad
+// entre empresas): tanto este PUT como el DELETE de abajo identificaban la plantilla SOLO por su
+// id numérico, sin confirmar que perteneciera a la empresa que hace la petición. GET
+// /plantillas/listar/:empresa_id sí filtraba correctamente (nadie ve plantillas de otra empresa
+// navegando la app), pero estos dos endpoints no — alguien que conociera o adivinara el id de una
+// plantilla ajena habría podido editarla o borrarla (no verla completa, pero sí manipularla). Se
+// exige empresa_id en el body y se agrega "AND empresa_id = $x" al UPDATE/DELETE para que una
+// empresa nunca pueda tocar la plantilla de otra, sin importar qué id envíe.
 router.put('/plantillas/:id', async (req, res) => {
   try {
     const { id } = req.params;
-    const { nombre, saludo, parrafo_contexto, condiciones_pago, tiempo_entrega, items, descuento } = req.body;
+    const { empresa_id, nombre, saludo, parrafo_contexto, condiciones_pago, tiempo_entrega, items, descuento } = req.body;
 
-    if (!nombre || !items || items.length === 0) {
-      return res.status(400).json({ error: 'nombre e items son obligatorios' });
+    if (!empresa_id || !nombre || !items || items.length === 0) {
+      return res.status(400).json({ error: 'empresa_id, nombre e items son obligatorios' });
     }
 
     const result = await pool.query(
       `UPDATE plantillas_cotizacion
        SET nombre = $1, saludo = $2, parrafo_contexto = $3, condiciones_pago = $4,
            tiempo_entrega = $5, items = $6, descuento = $7
-       WHERE id = $8 RETURNING *`,
+       WHERE id = $8 AND empresa_id = $9 RETURNING *`,
       [
         nombre,
         saludo || SALUDO_DEFECTO,
@@ -245,6 +253,7 @@ router.put('/plantillas/:id', async (req, res) => {
         JSON.stringify(items),
         parseFloat(descuento) || 0,
         id,
+        empresa_id,
       ]
     );
 
@@ -259,11 +268,18 @@ router.put('/plantillas/:id', async (req, res) => {
   }
 });
 
-// 🗑️ ELIMINAR plantilla
+// 🗑️ ELIMINAR plantilla (ver nota de seguridad arriba: ahora exige empresa_id también)
 router.delete('/plantillas/:id', async (req, res) => {
   try {
     const { id } = req.params;
-    await pool.query('DELETE FROM plantillas_cotizacion WHERE id = $1', [id]);
+    const { empresa_id } = req.query;
+    if (!empresa_id) {
+      return res.status(400).json({ error: 'empresa_id es obligatorio' });
+    }
+    const result = await pool.query('DELETE FROM plantillas_cotizacion WHERE id = $1 AND empresa_id = $2 RETURNING id', [id, empresa_id]);
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Plantilla no encontrada' });
+    }
     res.json({ mensaje: 'Plantilla eliminada exitosamente' });
   } catch (error) {
     console.error('Error eliminando plantilla:', error);
