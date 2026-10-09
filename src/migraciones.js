@@ -312,6 +312,14 @@ async function aplicarMigraciones() {
     // puntual (ej. una segunda etapa del mismo proyecto con un nombre distinto).
     await pool.query(`ALTER TABLE cotizaciones ADD COLUMN IF NOT EXISTS nombre_proyecto VARCHAR(255)`);
 
+    // Cotización sin cliente registrado (2026-10-08, a pedido del usuario): ahora se puede crear una
+    // cotización escribiendo el nombre a mano, sin elegir un cliente de la pantalla Clientes. Eso
+    // reutiliza cliente_nombre_snapshot (la misma columna que ya guardaba el nombre cuando se
+    // eliminaba un cliente) y exige que cliente_id acepte NULL. Ambas sentencias son idempotentes:
+    // si la columna ya existe / ya acepta NULL (como ya pasaba al borrar un cliente), no hacen nada.
+    await pool.query(`ALTER TABLE cotizaciones ADD COLUMN IF NOT EXISTS cliente_nombre_snapshot VARCHAR(255)`);
+    await pool.query(`ALTER TABLE cotizaciones ALTER COLUMN cliente_id DROP NOT NULL`);
+
     // Plantillas de cotización (2026-08-26): permiten precargar una cotización nueva con ítems,
     // párrafo, condiciones de pago, etc. ya definidos, para no reescribir cotizaciones muy
     // parecidas cada vez. No llevan cliente ni proyecto asociado — solo el "molde" de texto/ítems.

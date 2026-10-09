@@ -83,12 +83,17 @@ router.post('/crear', async (req, res) => {
   const client = await pool.connect();
   try {
     const {
-      empresa_id, cliente_id, proyecto_id, items, descuento,
+      empresa_id, cliente_id, cliente_nombre, proyecto_id, items, descuento,
       propietario, ciudad, saludo, parrafo_contexto, nombre_proyecto, condiciones_pago, tiempo_entrega, firmante,
     } = req.body;
 
-    if (!empresa_id || !cliente_id || !items || items.length === 0) {
-      return res.status(400).json({ error: 'empresa_id, cliente_id e items son obligatorios' });
+    // Cotización sin cliente registrado (2026-10-08): se acepta cliente_id (cliente de la pantalla
+    // Clientes) O cliente_nombre (nombre escrito a mano). Si no hay cliente_id, ese nombre se guarda
+    // en cliente_nombre_snapshot — la misma columna que ya usan las cotizaciones cuyo cliente fue
+    // eliminado — así todo lo que ya muestra "cliente_nombre" (lista, PDF, contrato) funciona igual.
+    const nombreLibre = (cliente_nombre || '').trim();
+    if (!empresa_id || (!cliente_id && !nombreLibre) || !items || items.length === 0) {
+      return res.status(400).json({ error: 'empresa_id, un cliente (o su nombre) e items son obligatorios' });
     }
 
     await client.query('BEGIN');
@@ -103,11 +108,11 @@ router.post('/crear', async (req, res) => {
 
     const cotizacionResult = await client.query(
       `INSERT INTO cotizaciones
-        (empresa_id, cliente_id, proyecto_id, numero, total, descuento,
+        (empresa_id, cliente_id, cliente_nombre_snapshot, proyecto_id, numero, total, descuento,
          propietario, ciudad, saludo, parrafo_contexto, nombre_proyecto, condiciones_pago, tiempo_entrega, firmante)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14) RETURNING *`,
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15) RETURNING *`,
       [
-        empresa_id, cliente_id, proyecto_id || null, numero, total, parseFloat(descuento) || 0,
+        empresa_id, cliente_id || null, cliente_id ? null : nombreLibre, proyecto_id || null, numero, total, parseFloat(descuento) || 0,
         propietario || null, ciudad || null,
         saludo || SALUDO_DEFECTO,
         parrafo_contexto || PARRAFO_CONTEXTO_DEFECTO,
@@ -333,7 +338,11 @@ router.post('/:id/aceptar', async (req, res) => {
 
     const clienteResult = await client.query('SELECT * FROM clientes WHERE id = $1', [cotizacion.cliente_id]);
     const cliente = clienteResult.rows[0];
-    const nombreProyecto = (cliente && cliente.nombre_proyecto) ? cliente.nombre_proyecto : `Proyecto de ${cliente ? cliente.nombre : 'cliente'}`;
+    // Cotización sin cliente registrado (2026-10-08): si no hay ficha de cliente, se usa el nombre de
+    // proyecto escrito en la propia cotización, y si tampoco, el nombre libre guardado en el snapshot.
+    const nombreProyecto = (cliente && cliente.nombre_proyecto)
+      ? cliente.nombre_proyecto
+      : (cotizacion.nombre_proyecto || `Proyecto de ${cliente?.nombre || cotizacion.cliente_nombre_snapshot || 'cliente'}`);
 
     await client.query(
       "UPDATE cotizaciones SET aceptada = TRUE, estado = 'aceptada', updated_at = CURRENT_TIMESTAMP WHERE id = $1",
@@ -434,8 +443,12 @@ router.post('/contratos/:id/crear-proyecto', async (req, res) => {
     await client.query('BEGIN');
 
     let cliente = null;
+    // Nombre libre de una cotización sin cliente registrado (2026-10-08): se usa como snapshot del
+    // proyecto cuando no hay ficha de cliente.
+    let nombreClienteLibre = null;
     if (contrato.cotizacion_id) {
-      const cotizacionResult = await client.query('SELECT cliente_id FROM cotizaciones WHERE id = $1', [contrato.cotizacion_id]);
+      const cotizacionResult = await client.query('SELECT cliente_id, cliente_nombre_snapshot FROM cotizaciones WHERE id = $1', [contrato.cotizacion_id]);
+      nombreClienteLibre = cotizacionResult.rows[0]?.cliente_nombre_snapshot || null;
       const clienteId = cotizacionResult.rows[0]?.cliente_id;
       if (clienteId) {
         const clienteResult = await client.query('SELECT * FROM clientes WHERE id = $1', [clienteId]);
@@ -452,7 +465,7 @@ router.post('/contratos/:id/crear-proyecto', async (req, res) => {
         contrato.proyecto_nombre_snapshot || 'Proyecto sin nombre',
         contrato.proyecto_direccion_snapshot || null,
         contrato.proyecto_mts2_snapshot || null,
-        cliente?.nombre || null,
+        cliente?.nombre || nombreClienteLibre,
         cliente?.celular || null,
         cliente?.cedula || null,
         creado_por_usuario_id || null,
@@ -826,7 +839,7 @@ router.get('/contratos/listar/:empresa_id', async (req, res) => {
       `SELECT ct.*,
               COALESCE(p.nombre, ct.proyecto_nombre_snapshot) AS proyecto_nombre,
               p.estado AS proyecto_estado,
-              cl.nombre AS cliente_nombre
+              COALESCE(cl.nombre, co.cliente_nombre_snapshot) AS cliente_nombre
        FROM contratos ct
        LEFT JOIN proyectos p ON p.id = ct.proyecto_id
        LEFT JOIN cotizaciones co ON co.id = ct.cotizacion_id
@@ -1003,7 +1016,12 @@ async function generarYGuardarPdfContrato(cotizacionId, contratoId, proyectoId) 
     ? (await pool.query('SELECT * FROM cotizacion_items WHERE cotizacion_id = $1', [cotizacionId])).rows
     : [];
   const clienteId = cotizacion?.cliente_id;
-  const cliente = clienteId ? (await pool.query('SELECT * FROM clientes WHERE id = $1', [clienteId])).rows[0] : null;
+  let cliente = clienteId ? (await pool.query('SELECT * FROM clientes WHERE id = $1', [clienteId])).rows[0] : null;
+  // Cotización sin cliente registrado (2026-10-08): si no hay ficha de cliente, el PDF del contrato
+  // usa el nombre libre guardado en la cotización, para que el ORDENANTE y la firma no queden vacíos.
+  if (!cliente && (cotizacion?.cliente_nombre_snapshot || cotizacion?.propietario)) {
+    cliente = { nombre: cotizacion.cliente_nombre_snapshot || cotizacion.propietario };
+  }
   const empresa = (await pool.query('SELECT * FROM empresas WHERE id = $1', [contrato.empresa_id])).rows[0];
 
   const buffer = await generarPdfBuffer({
